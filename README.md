@@ -28,7 +28,7 @@ hardware. NAT, WAN cutover, and firewall in progress.
 ## Topology
 
 ```
-  Building fiber
+  Building uplink
         |
   [ wall jack ]                        ~885 Mbps down / 735 up
         |
@@ -51,16 +51,16 @@ hardware. NAT, WAN cutover, and firewall in progress.
 
 ## The environment
 
-The apartment has three Ethernet jacks and they are not all the same network.
+The apartment has three Ethernet jacks and they are not all on the same network.
 
-**Fast jack.** Hands out `192.168.1.x` behind gateway `192.168.1.1`, no captive
-portal, roughly 885 Mbps down and 735 up measured at peak hours with a 1ms ping.
-This is the WAN uplink.
+**Fast jack.** Hands out addresses in `192.168.1.0/24` behind gateway
+`192.168.1.1`, no captive portal, roughly 885 Mbps down and 735 up measured at
+peak hours with a 1ms ping. This is the WAN uplink.
 
-**Living room jack.** Hands out `10.254.x.x` behind gateway `10.254.0.1`, runs a
-captive portal, roughly 90 Mbps. This is the Astound FastMesh amenity network,
-fed through a Plasma Cloud PAX1800 access point mounted on the wall above the
-jack. That hardware belongs to the provider and is left alone.
+**Living room jack.** Hands out addresses in `10.254.0.0/16` behind gateway
+`10.254.0.1`, runs a captive portal, roughly 90 Mbps. This is the building's
+amenity network, fed through a provider-owned access point mounted on the wall
+above the jack. That hardware is left alone.
 
 The two are entirely separate. Diagnosing that took a while, because the obvious
 first guess for the slow jack was a bad cable. The captive portal was the clue
@@ -73,14 +73,15 @@ that ruled it out.
 
 `wlan0` stays joined to the amenity wifi as a secondary internet path. Getting
 through the portal from a headless machine was solved by registering the Pi's
-wifi MAC (`88:a2:9e:68:0c:39`) in the portal's MAC authentication profile, which
-skips the login page entirely. Verified with:
+wifi MAC in the portal's own MAC authentication profile, which skips the login
+page entirely. Verified with:
 
 ```
 curl -s -o /dev/null -w "%{http_code}\n" http://connectivitycheck.gstatic.com/generate_204
 ```
 
-A `204` means authenticated and clear.
+A `204` means authenticated and clear. Anything else means the walled garden is
+still in the way.
 
 ### Why the wifi is not a management path
 
@@ -98,6 +99,7 @@ console is the only real recovery path for the firewall step.
 | `lan-setup.sh` | The `nmcli` command that gives `eth1` its static `192.168.50.1` |
 | `dnsmasq.conf` | DHCP server and caching DNS resolver for the LAN |
 | `firewall.sh` | NAT masquerade and iptables rules. Interface names are variables at the top |
+| `.gitignore` | Keeps NetworkManager profiles and keys out of the repo |
 
 ### dnsmasq notes
 
@@ -108,7 +110,7 @@ handing out leases on the building's network.
 `no-resolv` is there for a specific reason. Without it, dnsmasq reads
 `/etc/resolv.conf` on startup and picks up whatever DNS server `wlan0` got from
 the amenity network's DHCP, adding it as a third upstream. Some queries would
-then leave through the provider's resolver. `no-resolv` restricts it to the
+then leave through the building's resolver. `no-resolv` restricts it to the
 servers named in the config.
 
 ### firewall.sh notes
@@ -135,10 +137,12 @@ Use `nmcli` instead.
 **Files in `/etc/netplan/` are not necessarily netplan config.** On this OS,
 NetworkManager exports a YAML alongside each connection it creates. They carry
 `renderer: NetworkManager` and the NM UUID. The real config lives in
-`/etc/NetworkManager/system-connections/`.
+`/etc/NetworkManager/system-connections/`, and those files contain wifi PSKs in
+plain text, so keep them out of version control.
 
-**Do not trust interface names.** `ethtool -i <iface>` and its `bus-info` line is
-the ground truth. A platform address means built-in, a USB path means an adapter.
+**Do not trust interface names.** `ethtool -i <iface>` and its `bus-info` line
+is the ground truth. A platform address means built-in, a USB path means an
+adapter.
 
 **When you reconfigure the interface you are connected over, chain the
 commands.** `nmcli con add ... && nmcli con up lan` completes even after the
@@ -174,7 +178,7 @@ which lets the kernel shortcut established connections.
 - [ ] Convert to nftables with flow offload and re-measure
 - [ ] Arm the default-drop firewall (requires console gear on hand)
 - [ ] Add a Wi-Fi 6 access point on the LAN side
-- [ ] Confirm with the leasing office who owns gateway `192.168.1.1`
+- [ ] Confirm who owns gateway `192.168.1.1` and whether that jack is mine
 
 Later ideas: Pi-hole for network-wide ad blocking, Tailscale for remote access
 (port forwarding is unavailable behind the building's NAT), and `vnstat` for
