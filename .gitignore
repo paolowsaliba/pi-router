@@ -1,0 +1,7 @@
+# Never commit NetworkManager profiles, they contain wifi PSKs
+*.nmconnection
+system-connections/
+*.pem
+*.key
+id_*
+.env
