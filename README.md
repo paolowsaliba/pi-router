@@ -1,3 +1,5 @@
+Status: In progress. LAN interface and DHCP configured. NAT, firewall, and WAN cutover in progress.
+
 # Raspberry Pi Router
 
 A working home router built from a Raspberry Pi 4 running Raspberry Pi OS Lite.
