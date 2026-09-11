@@ -424,3 +424,78 @@ The router forwards traffic correctly and filters almost nothing.
 Fix order: SSH keys and disable password auth first (biggest exposure, no
 lockout risk), then `netfilter-persistent save`, then default-drop policies once
 console gear is on hand.
+
+
+## 2026-09-11 — SSH hardening
+
+### The reboot proved the persistence gap
+
+Rebooted the Pi before running `netfilter-persistent save`. Everything came back
+except the firewall. The LAN interface, dnsmasq, and IP forwarding all survived,
+because those live in config files that load at boot. The iptables rules were
+gone, because they only ever existed in kernel memory.
+
+The failure is quiet: NAT stops, LAN clients lose internet, and nothing in the
+logs points at the cause.
+
+### SSH key install failed silently
+
+Generated an ed25519 keypair on the laptop, installed the public key to the Pi,
+and passwordless login still prompted for a password.
+
+`ssh -v` showed the laptop offering the correct key, then the server replying
+"Authentications that can continue: publickey,password" and falling through to a
+password prompt. That is a server-side rejection, not a client problem.
+
+Checked on the Pi:
+
+-rw------- 1 psaliba psaliba 0 Jun 17 17:27 authorized_keys
+
+
+Zero bytes. The key was never written. The install one-liner piped the public
+key from PowerShell into `ssh`, and PowerShell can encode piped output as
+UTF-16, so the remote `cat` received nothing usable. Neither end raised an
+error.
+
+Installed it by pasting into `nano` instead, then verified with `wc -l` that it
+landed as a single unwrapped line. A key split across lines fails exactly the
+same way an empty file does, with no useful error either way.
+
+Worth remembering: `ssh -v` tells you which side rejected the auth. "Offering
+public key" followed by "Authentications that can continue" means the server
+said no.
+
+### Password authentication disabled
+
+Verified passwordless login worked in a separate session first, then set in
+`/etc/ssh/sshd_config`:
+
+PasswordAuthentication no
+PermitRootLogin no
+
+
+Restarted `ssh` and confirmed a fresh login still worked before closing the
+original session. Did all of this while `eth0` was unplugged, so the Pi was only
+reachable over the direct LAN cable and there was nothing exposed to lock myself
+out of.
+
+This closes the largest of the three security gaps from yesterday. sshd still
+listens on all interfaces including the WAN, but a key is now the only way in.
+Restricting the listener to the LAN side comes with the default-drop INPUT
+rules.
+
+### Made firewall.sh idempotent
+
+The script used `-A` to append rules, so running it twice produced duplicates.
+Added `iptables -F` and `iptables -t nat -F` at the top so it always starts from
+a clean state. A config script that cannot be safely re-run is a trap.
+
+### Remaining security gaps
+
+1. `FORWARD` policy is still ACCEPT. The rules permit traffic; nothing denies
+   any, so the default is wide open.
+2. `INPUT` policy is still ACCEPT with no rules.
+3. Rules still not persisted across reboot.
+
+Next: `netfilter-persistent save`, then default-drop policies once console gear
+is on hand.
