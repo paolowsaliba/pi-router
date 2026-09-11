@@ -331,3 +331,96 @@ New habit: `git diff --cached` before every commit.
 5. Arm the firewall (needs console gear on hand first).
 6. Add a Wi-Fi 6 access point on the LAN side. The Pi's own radio cannot serve
    885 Mbps and cannot run AP mode while `wlan0` is doing anything else.
+
+## 2026-09-10 — NAT, first traffic through the router, throughput measured
+
+### IP forwarding: sysctl.conf no longer exists
+
+The guide says to uncomment `net.ipv4.ip_forward=1` in `/etc/sysctl.conf`. That
+file is not present on this OS. Newer Debian replaced the single config file
+with drop-ins under `/etc/sysctl.d/`, which already held `98-rpi.conf` and
+`README.sysctl`.
+
+Created `/etc/sysctl.d/99-router.conf` instead. The `99` prefix loads after the
+existing files so it takes precedence. Applied with `sudo sysctl --system` and
+confirmed it survived a reboot.
+
+Second time a tutorial has pointed at a file this OS no longer uses, after
+`/etc/dhcpcd.conf`. Nano opens a blank buffer for a path that never existed,
+which makes a failed edit look like a successful one.
+
+### NAT rules
+
+Three iptables rules, with interface names as variables at the top of
+`firewall.sh`:
+
+- `POSTROUTING -o $WAN_IF -j MASQUERADE` — rewrites outbound LAN traffic to
+  appear to come from the Pi, and reverses it on the way back.
+- `FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT` — lets replies to
+  connections we started come back through.
+- `FORWARD -i $LAN_IF -o $WAN_IF -j ACCEPT` — lets LAN clients out.
+
+### Checked the default route before measuring
+
+With `eth0` on the fast jack, the Pi had two default routes:
+
+default via 192.168.1.1 dev eth0 metric 101
+default via 10.254.0.1 dev wlan0 metric 600
+
+
+Lower metric wins, so wired takes priority. Worth verifying rather than
+assuming, because if wifi had won, every throughput number below would have
+been measured against a 90 Mbps path instead of an 885 one.
+
+### Throughput through the router
+
+First comparison was against a baseline taken days earlier on different test
+servers, which made the numbers suspect. Reran both sides minutes apart against
+the same server (KamaTera, Seattle) to get a controlled A/B.
+
+Laptop plugged straight into the wall jack:
+
+867.2 / 739.1 885.3 / 739.5 883.7 / 729.9 Mbps
+Mean: ~879 down / 736 up
+
+
+Laptop behind the Pi:
+
+823.2 / 726.6 827.4 / 747.1 815.4 / 723.5 Mbps
+Mean: ~822 down / 732 up
+
+
+**Cost of routing through the Pi: ~57 Mbps down (6.5%), ~4 Mbps up (0.5%).**
+
+The asymmetry is the interesting part. Download loses 6.5% while upload is
+effectively unchanged. Most likely because download is where the packet volume
+is: bulk data arriving inbound means far more packets per second to evaluate
+against the FORWARD chain and rewrite through NAT. Upload on a speed test is
+smaller in raw packet count, so the per-packet CPU cost barely registers.
+
+Better than I expected going in. The usual figure quoted for a Pi 4 doing
+iptables NAT is 600-800 Mbps, and this held 93% of the line.
+
+This reframes the planned nftables flow offload work. I had it down as
+recovering a large loss. The actual ceiling is about 57 Mbps, so it is
+optimization rather than rescue. Still worth doing and worth measuring, but
+worth being honest that the headline number will be small.
+
+Lesson on methodology: the first comparison used different test servers on
+different nights and would have let me attribute server variance to the router.
+Controlling the variable took ten minutes and turned a guess into a measurement.
+
+### Security state after Step 8: not done
+
+The router forwards traffic correctly and filters almost nothing.
+
+- `INPUT` policy is still ACCEPT and has no rules, so `sshd` is reachable from
+  the WAN side at `192.168.1.149`. Since I still do not know who owns
+  `192.168.1.1`, other residents may be on that subnet.
+- `FORWARD` policy is still ACCEPT. The three rules permit traffic; nothing
+  denies any.
+- Rules live in memory only. A reboot drops NAT and LAN clients lose internet.
+
+Fix order: SSH keys and disable password auth first (biggest exposure, no
+lockout risk), then `netfilter-persistent save`, then default-drop policies once
+console gear is on hand.
