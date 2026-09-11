@@ -5,6 +5,10 @@
 WAN_IF="eth0"
 LAN_IF="eth1"
 
+# Start from a clean slate so the script can be re-run safely.
+sudo iptables -F
+sudo iptables -t nat -F
+
 # Rewrite outbound LAN traffic to look like it came from the Pi.
 sudo iptables -t nat -A POSTROUTING -o $WAN_IF -j MASQUERADE
 
