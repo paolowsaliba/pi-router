@@ -499,3 +499,36 @@ a clean state. A config script that cannot be safely re-run is a trap.
 
 Next: `netfilter-persistent save`, then default-drop policies once console gear
 is on hand.
+
+### Persistence confirmed
+
+Ran `netfilter-persistent save`, rebooted, and checked the NAT table with
+nothing run manually:
+
+Chain POSTROUTING (policy ACCEPT)
+pkts bytes target prot opt in out source destination
+0 0 MASQUERADE all -- * eth0 0.0.0.0/0 0.0.0.0/0
+
+
+Rules now load from `/etc/iptables/rules.v4` at boot. The router survives a
+power cut without intervention, which is the difference between a demo and
+something that actually runs.
+
+Zero packets on the counter is expected. Nothing had been forwarded yet since
+boot.
+
+### SSH unreachable briefly after reboot
+
+Could not SSH to `192.168.50.1` immediately after the reboot. "Unknown error"
+from the Windows client, which usually means no network path rather than a
+refused connection.
+
+Resolved on its own shortly after. Most likely dnsmasq and the LAN interface
+racing at boot, or the laptop holding a stale lease. Worth watching. If it
+recurs, the fix is a systemd dependency so dnsmasq waits for `eth1` to have its
+address.
+
+Also a reminder that the WAN-side SSH exposure is still open. Had the LAN side
+stayed down, `ssh psaliba@192.168.1.149` from another wall jack would have
+worked, because INPUT policy is still ACCEPT with no rules. Convenient today,
+still a gap.
