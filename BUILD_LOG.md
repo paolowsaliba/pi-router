@@ -512,7 +512,7 @@ Ran `netfilter-persistent save`, rebooted, and checked the NAT table with
 nothing run manually:
 
 Chain POSTROUTING (policy ACCEPT)
-pkts bytes target prot opt in out source destination
+## 2026-09-13pkts bytes target prot opt in out source destination
 0 0 MASQUERADE all -- * eth0 0.0.0.0/0 0.0.0.0/0
 
 
@@ -538,3 +538,94 @@ Also a reminder that the WAN-side SSH exposure is still open. Had the LAN side
 stayed down, `ssh psaliba@192.168.1.149` from another wall jack would have
 worked, because INPUT policy is still ACCEPT with no rules. Convenient today,
 still a gap.
+
+
+## 2026-09-13
+
+### bind-dynamic did not fix the startup race
+
+Swapped `bind-interfaces` for `bind-dynamic` in dnsmasq.conf, rebooted, and got
+the same behaviour:
+
+    13:34:38  dnsmasq started
+    13:34:43  DHCP packet received on eth1 which has no address
+    13:36:35  DHCP packet received on eth1 which has no address
+    13:36:42  DHCPACK  192.168.50.165
+
+Two minutes before a LAN client could get an address. Confirmed with `grep` that
+the config change had applied, so the setting took effect and simply did not
+address the problem.
+
+Wrong layer. `bind-dynamic` changes how dnsmasq binds sockets to interfaces. The
+error message says `eth1` had no IPv4 address at all, and dnsmasq cannot serve a
+DHCP range on an interface with no address no matter how it binds. The delay is
+not in dnsmasq's startup order. It is `eth1` taking two minutes to get its
+static address from NetworkManager.
+
+Kept `bind-dynamic`, since it is the safer setting either way, and moved the
+investigation to NetworkManager and USB enumeration timing.
+
+Worth recording as a reasoning error: I matched "service starts before interface
+is ready" to a known fix without checking that the fix addressed the specific
+failure. The log message named the actual condition, no address on the
+interface, and that pointed somewhere else the whole time.
+
+### The real cause: a stale profile competing for eth1
+
+`journalctl -u NetworkManager` showed the actual sequence:
+
+    13:33:25  eth1 appears, carrier connected
+    13:33:26  starting connection 'netplan-eth0'
+    13:33:26  dhcp4 (eth1): beginning transaction (timeout in 45 seconds)
+    13:34:24  failed (reason 'ip-config-unavailable')
+    13:34:24  starting connection 'netplan-eth0'   <- retry
+    13:35:09  failed
+    13:35:54  failed
+    13:36:39  failed
+    13:36:39  starting connection 'lan'
+    13:36:39  Activation: successful
+
+The USB adapter was never slow. `dmesg` shows it registering at 5.2 seconds and
+NetworkManager had carrier a second later.
+
+`netplan-eth0` is a leftover profile from the original setup, configured for
+DHCP, with a `match: {}` block that matches any Ethernet device. It claims
+`eth1` at every boot and asks for a DHCP lease. Nothing on the LAN side answers,
+because the Pi *is* the DHCP server on that segment. Forty-five second timeout,
+retry, four rounds, then NetworkManager finally falls through to `lan`, which
+activates in 0.24 seconds because it is a static address.
+
+`systemd-analyze blame` corroborated it: `NetworkManager-wait-online.service`
+at 1min 71ms, by far the largest entry.
+
+Fixed by disabling autoconnect on the stale profile and raising the priority of
+mine:
+
+    sudo nmcli con modify "netplan-eth0" connection.autoconnect no
+    sudo nmcli con modify lan connection.autoconnect-priority 100
+
+Two wrong guesses before this one. First I assumed dnsmasq was starting too
+early, and changed `bind-interfaces` to `bind-dynamic`. Then I assumed USB
+enumeration was slow. Both were plausible and both were wrong, because I was
+reasoning from the shape of the symptom instead of reading the logs for the
+component that was actually stalling. The NetworkManager journal named the
+culprit outright on the first read.
+
+Also worth recording: back on 09-06 I noticed `netplan-eth0` bound to `eth1` and
+assumed adding my own profile would push it back to `eth0`. It never did. Its
+`match: {}` means it matches any Ethernet device, and nothing in that assumption
+was ever verified.
+
+### Confirmed
+
+After disabling autoconnect on the stale profile:
+
+    13:53:01  eth1 appears
+    13:53:02  carrier: link connected
+    13:53:02  starting connection 'lan'
+    13:53:02  Activation: successful
+
+Under one second, and `netplan-eth0` does not appear in the log at all.
+
+`NetworkManager-wait-online.service` dropped from 1min 71ms to 4.068s. Boot no
+longer stalls waiting for a DHCP lease that was never coming.
