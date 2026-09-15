@@ -623,3 +623,89 @@ Under one second, and `netplan-eth0` does not appear in the log at all.
 
 `NetworkManager-wait-online.service` dropped from 1min 71ms to 4.068s. Boot no
 longer stalls waiting for a DHCP lease that was never coming.
+
+### Fixing the boot delay broke the WAN
+
+Disabling autoconnect on `netplan-eth0` cost me internet for LAN clients. `eth0`
+had no address at all.
+
+That profile's `match: {}` meant it matched every Ethernet device, not just
+`eth1`. It was simultaneously the thing wrongly claiming the LAN adapter and the
+only profile giving `eth0` a DHCP lease from the wall jack. Disabling it stopped
+both.
+
+The LAN kept working throughout, which made it confusing. Clients still got
+addresses from dnsmasq and could reach the Pi. There was simply no uplink behind
+it for NAT to translate to.
+
+Fixed with a dedicated WAN profile bound explicitly by interface name:
+
+    sudo nmcli con add type ethernet ifname eth0 con-name wan ipv4.method auto
+    sudo nmcli con modify wan connection.autoconnect-priority 100
+
+Both interfaces now have their own profile bound to one specific device. No
+wildcard match, nothing to compete over. Deleted `netplan-eth0` once the
+replacement was confirmed working.
+
+The lesson is about `match: {}`. I treated that profile as "the thing wrongly
+claiming eth1" without asking what else it was doing. A wildcard profile is
+doing its job on every interface, so disabling it has effects everywhere, not
+just where the problem was visible.
+
+### Ruled out thermal throttling
+
+Before measuring nftables against iptables, checked whether heat was part of the
+57 Mbps NAT gap. A throttling Pi would make any software comparison meaningless.
+
+    Idle:        ~45°C
+    Under load:  peaked 54°C
+    throttled=0x0 on every check
+
+Throttling begins at 80°C, so there is 26°C of headroom. No thermal component to
+the throughput loss.
+
+A negative result, but worth having: the gap is software, and the nftables
+measurement will be measuring what I think it is.
+
+### Argon ONE M.2 case
+
+Installed the case. No M.2 drive, enclosure and cooling only. Adding a boot
+device migration on top of unfinished firewall and AP work would mean not
+knowing which change caused the next problem.
+
+Two decisions worth recording:
+
+- **Jumper set to pin 2-3 (Always ON).** Default pin 1-2 requires a button press
+  to power on after an outage. For a router that would undo the persistence work,
+  since rules that survive a reboot are useless if the device waits for a human.
+- **Skipped the USB 3 bridge.** That connector links the M.2 board to one of the
+  Pi's USB 3.0 ports. With no drive installed there is nothing to bridge, which
+  leaves both blue ports free for the LAN adapter.
+
+Also note the expansion board takes **M.2 SATA only**, Key B or B+M. Not NVMe.
+Easy thing to get wrong when buying, since NVMe is the more common form now.
+
+Installed the fan control script from Argon. Default curve is 10% at 55°C, 55% at
+60°C, 100% at 65°C, so at a 54°C peak the fan will rarely spin. The manual's
+references to desktop icons do not apply on Pi OS Lite; `argonone-config` and
+`argonone-uninstall` work from the terminal.
+
+Verified nothing regressed after reassembly:
+
+    sudo ethtool eth1 | grep -i speed   -> Speed: 1000Mb/s
+    lsusb -t                            -> cdc_ncm on a 5000M bus
+
+The case routes both micro-HDMI ports to a single full-size HDMI on the back, so
+the console cable I need is standard HDMI, not micro.
+
+### SD card backup
+
+Imaged the card to a file before further changes, using Win32 Disk Imager's Read
+function. Raspberry Pi Imager only writes images, it cannot read a card back.
+
+Windows offers to format the card when it is inserted, because it cannot read the
+ext4 root partition and assumes damage. Cancelling that is important.
+
+What is on the card and not in the repo: the OS install, installed packages, SSH
+keys and `authorized_keys`, the NetworkManager profiles, and the saved wifi PSK.
+The image stays off GitHub, both for size and because it contains a private key.
