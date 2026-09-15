@@ -500,19 +500,13 @@ a clean state. A config script that cannot be safely re-run is a trap.
 Next: `netfilter-persistent save`, then default-drop policies once console gear
 is on hand.
 
-```
-Chain POSTROUTING (policy ACCEPT)
- pkts bytes target      prot opt in   out    source     destination
-    0     0 MASQUERADE  all  --  *    eth0   0.0.0.0/0  0.0.0.0/0
-```
-
 ### Persistence confirmed
 
 Ran `netfilter-persistent save`, rebooted, and checked the NAT table with
 nothing run manually:
 
 Chain POSTROUTING (policy ACCEPT)
-## 2026-09-13pkts bytes target prot opt in out source destination
+pkts bytes target prot opt in out source destination
 0 0 MASQUERADE all -- * eth0 0.0.0.0/0 0.0.0.0/0
 
 
