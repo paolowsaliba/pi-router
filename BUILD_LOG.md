@@ -175,7 +175,7 @@ Every client gets a lane to the internet and no path sideways.
 So `wlan0` is a working internet path for the Pi but useless for reaching it.
 Better to learn this now than during the firewall step.
 
-**Action item: buy a micro-HDMI cable and a USB keyboard before arming the
+**Action item: buy a console cable and a USB keyboard before arming the
 firewall.** Local console is the only real backstop left.
 
 ### LAN interface up
@@ -319,19 +319,6 @@ New habit: `git diff --cached` before every commit.
 
 ---
 
-## Next
-
-1. Enable IP forwarding, write the NAT rule with `eth0` as WAN.
-2. Move the Pi to the fast jack, confirm a LAN client reaches the internet.
-3. **Measure throughput through the Pi and compare against the 885 baseline.**
-   Expect a shortfall. A Pi 4 doing iptables NAT typically lands 600-800 Mbps
-   because every packet costs CPU time.
-4. Convert to nftables with flow offload and measure a third time. Target is
-   recovering most of the gap.
-5. Arm the firewall (needs console gear on hand first).
-6. Add a Wi-Fi 6 access point on the LAN side. The Pi's own radio cannot serve
-   885 Mbps and cannot run AP mode while `wlan0` is doing anything else.
-
 ## 2026-09-10 — NAT, first traffic through the router, throughput measured
 
 ### IP forwarding: sysctl.conf no longer exists
@@ -364,9 +351,10 @@ Three iptables rules, with interface names as variables at the top of
 
 With `eth0` on the fast jack, the Pi had two default routes:
 
-default via 192.168.1.1 dev eth0 metric 101
-default via 10.254.0.1 dev wlan0 metric 600
-
+```
+default via 192.168.1.1  dev eth0   metric 101
+default via 10.254.0.1   dev wlan0  metric 600
+```
 
 Lower metric wins, so wired takes priority. Worth verifying rather than
 assuming, because if wifi had won, every throughput number below would have
@@ -380,15 +368,17 @@ the same server (KamaTera, Seattle) to get a controlled A/B.
 
 Laptop plugged straight into the wall jack:
 
-867.2 / 739.1 885.3 / 739.5 883.7 / 729.9 Mbps
+```
+867.2 / 739.1    885.3 / 739.5    883.7 / 729.9   Mbps
 Mean: ~879 down / 736 up
-
+```
 
 Laptop behind the Pi:
 
-823.2 / 726.6 827.4 / 747.1 815.4 / 723.5 Mbps
+```
+823.2 / 726.6    827.4 / 747.1    815.4 / 723.5   Mbps
 Mean: ~822 down / 732 up
-
+```
 
 **Cost of routing through the Pi: ~57 Mbps down (6.5%), ~4 Mbps up (0.5%).**
 
@@ -410,7 +400,7 @@ Lesson on methodology: the first comparison used different test servers on
 different nights and would have let me attribute server variance to the router.
 Controlling the variable took ten minutes and turned a guess into a measurement.
 
-### Security state after Step 8: not done
+### Security state after NAT: not done
 
 The router forwards traffic correctly and filters almost nothing.
 
@@ -425,6 +415,7 @@ Fix order: SSH keys and disable password auth first (biggest exposure, no
 lockout risk), then `netfilter-persistent save`, then default-drop policies once
 console gear is on hand.
 
+---
 
 ## 2026-09-11 — SSH hardening
 
@@ -449,8 +440,9 @@ password prompt. That is a server-side rejection, not a client problem.
 
 Checked on the Pi:
 
+```
 -rw------- 1 psaliba psaliba 0 Jun 17 17:27 authorized_keys
-
+```
 
 Zero bytes. The key was never written. The install one-liner piped the public
 key from PowerShell into `ssh`, and PowerShell can encode piped output as
@@ -470,19 +462,19 @@ said no.
 Verified passwordless login worked in a separate session first, then set in
 `/etc/ssh/sshd_config`:
 
+```
 PasswordAuthentication no
 PermitRootLogin no
-
+```
 
 Restarted `ssh` and confirmed a fresh login still worked before closing the
 original session. Did all of this while `eth0` was unplugged, so the Pi was only
 reachable over the direct LAN cable and there was nothing exposed to lock myself
 out of.
 
-This closes the largest of the three security gaps from yesterday. sshd still
-listens on all interfaces including the WAN, but a key is now the only way in.
-Restricting the listener to the LAN side comes with the default-drop INPUT
-rules.
+This closes the largest of the three security gaps. sshd still listens on all
+interfaces including the WAN, but a key is now the only way in. Restricting the
+listener to the LAN side comes with the default-drop INPUT rules.
 
 ### Made firewall.sh idempotent
 
@@ -490,25 +482,16 @@ The script used `-A` to append rules, so running it twice produced duplicates.
 Added `iptables -F` and `iptables -t nat -F` at the top so it always starts from
 a clean state. A config script that cannot be safely re-run is a trap.
 
-### Remaining security gaps
-
-1. `FORWARD` policy is still ACCEPT. The rules permit traffic; nothing denies
-   any, so the default is wide open.
-2. `INPUT` policy is still ACCEPT with no rules.
-3. Rules still not persisted across reboot.
-
-Next: `netfilter-persistent save`, then default-drop policies once console gear
-is on hand.
-
 ### Persistence confirmed
 
 Ran `netfilter-persistent save`, rebooted, and checked the NAT table with
 nothing run manually:
 
+```
 Chain POSTROUTING (policy ACCEPT)
-pkts bytes target prot opt in out source destination
-0 0 MASQUERADE all -- * eth0 0.0.0.0/0 0.0.0.0/0
-
+ pkts bytes target      prot opt in   out    source     destination
+    0     0 MASQUERADE  all  --  *    eth0   0.0.0.0/0  0.0.0.0/0
+```
 
 Rules now load from `/etc/iptables/rules.v4` at boot. The router survives a
 power cut without intervention, which is the difference between a demo and
@@ -517,6 +500,31 @@ something that actually runs.
 Zero packets on the counter is expected. Nothing had been forwarded yet since
 boot.
 
+### FORWARD counters stayed at zero
+
+Ran `ping google.com` from the Pi to check the FORWARD counters were moving.
+They stayed at zero, which looked like the rules were not matching.
+
+They were fine. Traffic the router generates itself goes through OUTPUT, not
+FORWARD. FORWARD only sees packets that arrive on one interface and leave
+through another. Pinging from the Pi never touches it.
+
+The NAT counter did move, because POSTROUTING catches locally generated traffic
+as well as forwarded traffic.
+
+Reran the same ping from a LAN client:
+
+```
+42811  36M   ACCEPT  all  --  *     *     state RELATED,ESTABLISHED
+  491  110K  ACCEPT  all  --  eth1  eth0
+```
+
+36 MB matched on the established rule against 110 KB on the LAN-to-WAN rule. A
+small number of outbound packets open connections, and everything that comes
+back matches on state. That ratio is what working NAT looks like.
+
+Testing a router from the router itself does not test the thing you care about.
+
 ### SSH unreachable briefly after reboot
 
 Could not SSH to `192.168.50.1` immediately after the reboot. "Unknown error"
@@ -524,27 +532,28 @@ from the Windows client, which usually means no network path rather than a
 refused connection.
 
 Resolved on its own shortly after. Most likely dnsmasq and the LAN interface
-racing at boot, or the laptop holding a stale lease. Worth watching. If it
-recurs, the fix is a systemd dependency so dnsmasq waits for `eth1` to have its
-address.
+racing at boot, or the laptop holding a stale lease. Worth watching.
 
 Also a reminder that the WAN-side SSH exposure is still open. Had the LAN side
 stayed down, `ssh psaliba@192.168.1.149` from another wall jack would have
 worked, because INPUT policy is still ACCEPT with no rules. Convenient today,
 still a gap.
 
+---
 
-## 2026-09-13
+## 2026-09-13 — Boot delay, WAN profile, case assembly
 
 ### bind-dynamic did not fix the startup race
 
 Swapped `bind-interfaces` for `bind-dynamic` in dnsmasq.conf, rebooted, and got
 the same behaviour:
 
-    13:34:38  dnsmasq started
-    13:34:43  DHCP packet received on eth1 which has no address
-    13:36:35  DHCP packet received on eth1 which has no address
-    13:36:42  DHCPACK  192.168.50.165
+```
+13:34:38  dnsmasq started
+13:34:43  DHCP packet received on eth1 which has no address
+13:36:35  DHCP packet received on eth1 which has no address
+13:36:42  DHCPACK  192.168.50.165
+```
 
 Two minutes before a LAN client could get an address. Confirmed with `grep` that
 the config change had applied, so the setting took effect and simply did not
@@ -568,16 +577,18 @@ interface, and that pointed somewhere else the whole time.
 
 `journalctl -u NetworkManager` showed the actual sequence:
 
-    13:33:25  eth1 appears, carrier connected
-    13:33:26  starting connection 'netplan-eth0'
-    13:33:26  dhcp4 (eth1): beginning transaction (timeout in 45 seconds)
-    13:34:24  failed (reason 'ip-config-unavailable')
-    13:34:24  starting connection 'netplan-eth0'   <- retry
-    13:35:09  failed
-    13:35:54  failed
-    13:36:39  failed
-    13:36:39  starting connection 'lan'
-    13:36:39  Activation: successful
+```
+13:33:25  eth1 appears, carrier connected
+13:33:26  starting connection 'netplan-eth0'
+13:33:26  dhcp4 (eth1): beginning transaction (timeout in 45 seconds)
+13:34:24  failed (reason 'ip-config-unavailable')
+13:34:24  starting connection 'netplan-eth0'   <- retry
+13:35:09  failed
+13:35:54  failed
+13:36:39  failed
+13:36:39  starting connection 'lan'
+13:36:39  Activation: successful
+```
 
 The USB adapter was never slow. `dmesg` shows it registering at 5.2 seconds and
 NetworkManager had carrier a second later.
@@ -595,8 +606,10 @@ at 1min 71ms, by far the largest entry.
 Fixed by disabling autoconnect on the stale profile and raising the priority of
 mine:
 
-    sudo nmcli con modify "netplan-eth0" connection.autoconnect no
-    sudo nmcli con modify lan connection.autoconnect-priority 100
+```
+sudo nmcli con modify "netplan-eth0" connection.autoconnect no
+sudo nmcli con modify lan connection.autoconnect-priority 100
+```
 
 Two wrong guesses before this one. First I assumed dnsmasq was starting too
 early, and changed `bind-interfaces` to `bind-dynamic`. Then I assumed USB
@@ -614,10 +627,12 @@ was ever verified.
 
 After disabling autoconnect on the stale profile:
 
-    13:53:01  eth1 appears
-    13:53:02  carrier: link connected
-    13:53:02  starting connection 'lan'
-    13:53:02  Activation: successful
+```
+13:53:01  eth1 appears
+13:53:02  carrier: link connected
+13:53:02  starting connection 'lan'
+13:53:02  Activation: successful
+```
 
 Under one second, and `netplan-eth0` does not appear in the log at all.
 
@@ -640,8 +655,10 @@ it for NAT to translate to.
 
 Fixed with a dedicated WAN profile bound explicitly by interface name:
 
-    sudo nmcli con add type ethernet ifname eth0 con-name wan ipv4.method auto
-    sudo nmcli con modify wan connection.autoconnect-priority 100
+```
+sudo nmcli con add type ethernet ifname eth0 con-name wan ipv4.method auto
+sudo nmcli con modify wan connection.autoconnect-priority 100
+```
 
 Both interfaces now have their own profile bound to one specific device. No
 wildcard match, nothing to compete over. Deleted `netplan-eth0` once the
@@ -657,9 +674,11 @@ just where the problem was visible.
 Before measuring nftables against iptables, checked whether heat was part of the
 57 Mbps NAT gap. A throttling Pi would make any software comparison meaningless.
 
-    Idle:        ~45°C
-    Under load:  peaked 54°C
-    throttled=0x0 on every check
+```
+Idle:        ~45°C
+Under load:  peaked 54°C
+throttled=0x0 on every check
+```
 
 Throttling begins at 80°C, so there is 26°C of headroom. No thermal component to
 the throughput loss.
@@ -692,8 +711,10 @@ references to desktop icons do not apply on Pi OS Lite; `argonone-config` and
 
 Verified nothing regressed after reassembly:
 
-    sudo ethtool eth1 | grep -i speed   -> Speed: 1000Mb/s
-    lsusb -t                            -> cdc_ncm on a 5000M bus
+```
+sudo ethtool eth1 | grep -i speed   -> Speed: 1000Mb/s
+lsusb -t                            -> cdc_ncm on a 5000M bus
+```
 
 The case routes both micro-HDMI ports to a single full-size HDMI on the back, so
 the console cable I need is standard HDMI, not micro.
@@ -709,3 +730,37 @@ ext4 root partition and assumes damage. Cancelling that is important.
 What is on the card and not in the repo: the OS install, installed packages, SSH
 keys and `authorized_keys`, the NetworkManager profiles, and the saved wifi PSK.
 The image stays off GitHub, both for size and because it contains a private key.
+
+---
+
+## Current state
+
+| | |
+|---|---|
+| WAN | `eth0`, DHCP from the fast wall jack, profile `wan` |
+| LAN | `eth1` (USB adapter), static `192.168.50.1`, profile `lan` |
+| Wifi | `wlan0` on the amenity network, MAC-registered, internet only |
+| DHCP/DNS | dnsmasq on `eth1`, pool `.100`–`.200`, upstream 1.1.1.1 / 8.8.8.8 |
+| NAT | iptables MASQUERADE on `eth0`, persisted via `netfilter-persistent` |
+| SSH | key-only, passwords disabled, still listening on all interfaces |
+| Throughput | ~822 / 732 Mbps through the router vs ~879 / 736 at the wall |
+| Boot | ~4s to network-online |
+
+---
+
+## Next
+
+1. **nftables with flow offload**, measured against the current 822 Mbps figure.
+   Ceiling is about 57 Mbps, so this is optimization rather than rescue.
+2. **Default-drop INPUT and FORWARD policies**, plus restricting sshd to the LAN
+   interface. Waiting on console gear (standard HDMI cable and USB keyboard),
+   since this is the one step that can lock me out with no software recovery.
+3. **TP-Link Archer AX55 in AP mode** on the LAN side once it arrives. AX3000
+   Wi-Fi 6 with gigabit ports, DHCP disabled, connected to `eth1`.
+4. **Confirm who owns gateway `192.168.1.1`** and whether the fast jack is meant
+   to be mine. It does not respond on port 80 and uses OpenDNS, which looks like
+   managed property equipment rather than a leftover consumer router.
+
+Later ideas: Pi-hole for network-wide ad blocking, Tailscale for remote access
+(port forwarding is unavailable behind the building's NAT), `vnstat` for traffic
+history, and migrating boot from SD to M.2 SATA once everything else is settled.
