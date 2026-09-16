@@ -748,6 +748,157 @@ The image stays off GitHub, both for size and because it contains a private key.
 
 ---
 
+## 2026-09-15 to 09-16: nftables flow offload
+
+### Goal
+
+Measure whether an nftables flowtable wins back the ~57 Mbps download lost to
+routing through the Pi. With a ceiling that small, this was always going to be
+optimization, so the real question was whether the gain would be measurable
+at all.
+
+A flowtable lets the kernel recognize a connection it has already approved and
+send the rest of that connection's packets through a shortcut at the ingress
+hook. They skip the FORWARD chain and most of the regular netfilter path.
+
+### Setup
+
+Checked the environment first:
+
+```
+iptables v1.8.11 (nf_tables)
+nft_flow_offload       12288  0
+nf_flow_table          49152  1 nft_flow_offload
+```
+
+iptables here is the nf_tables backend, and the flow offload modules load on
+the stock Raspberry Pi kernel.
+
+I added the flowtable as its own separate nftables table and left the existing
+iptables NAT and FORWARD rules untouched. That keeps the test to one variable,
+and removing it is a single command. It also disappears on reboot, which is
+what I wanted for an experiment.
+
+```
+sudo nft -f - <<'EOF'
+table inet fastpath {
+  flowtable ft {
+    hook ingress priority 0
+    devices = { eth0, eth1 }
+  }
+  chain forward {
+    type filter hook forward priority 0; policy accept;
+    meta l4proto { tcp, udp } flow add @ft
+  }
+}
+EOF
+```
+
+The `policy accept` in this table is safe. In nftables, an accept in one table
+does not override a drop in another, so this table permits nothing new. It only
+adds the shortcut.
+
+Removal:
+
+```
+sudo nft delete table inet fastpath
+```
+
+**Gotcha:** my first attempt named the table `offload`. That is a reserved word
+in nftables (a flowtable flag for hardware offload), and the parser failed on
+it with a wall of syntax errors. Every error after the first was fallout from
+that one word. Renaming the table fixed it.
+
+### Method
+
+Same laptop, same Speedtest server (KamaTera, Seattle), A-B-A order so that
+ISP variance between runs would show up instead of getting credited to the
+router. While tests ran, I watched per-core CPU in `top` (press `1`) from a
+second SSH session.
+
+### Results
+
+| Setup | Download avg (Mbps) | Upload avg (Mbps) | Runs |
+|---|---|---|---|
+| Wall jack (earlier baseline) | ~879 | ~736 | 3 |
+| iptables only, 9/15 | ~834 | ~711 | 3 |
+| Flowtable loaded, 9/16 | ~889 | ~729 | 4 down, 3 up |
+| Flowtable removed, 9/16 | ~833 | ~698 | 3 |
+
+Raw runs:
+
+```
+iptables only:     827.5 / 702.3    830.2 / 725.3    843.2 / 704.8
+Flowtable loaded:  893.5 / --       881.5 / 729.6    888.4 / 731.2    892.2 / 727.5
+Flowtable removed: 835.3 / 685.3    837.2 / 718.8    825.4 / 689.4
+```
+
+**Download went from ~834 to ~889 Mbps.** That recovers essentially all of the
+routing loss. The flowtable average sits slightly above the wall baseline, but
+that baseline was taken on a different day, so I read it as "at line speed"
+and not as the Pi beating the wall.
+
+**The removed runs match the iptables-only runs from the day before.** ~833
+today versus ~834 yesterday. That is the check that rules out the ISP simply
+being faster during the flowtable runs.
+
+**Upload gained less.** About 20 to 30 Mbps depending on which no-flowtable
+group I compare against. Upload was already close to line speed.
+
+### Verification
+
+Throughput alone does not prove the shortcut is being used, so I counted
+offloaded connections in conntrack during a test:
+
+```
+sudo conntrack -L 2>/dev/null | grep -c OFFLOAD
+24    (flowtable loaded)
+0     (after removal)
+```
+
+My first try ran without `sudo`. conntrack printed a permission error and grep
+reported 0, which looks like "offload is not working" if you don't read the
+error. Worth remembering.
+
+### CPU: the actual bottleneck
+
+`top` showed the real story. Nearly all packet handling lands on **core 0**,
+visible as `ksoftirqd/0`. During downloads Cpu0 sat at 94 to 100% `si`
+(softirq) while cores 1 to 3 stayed idle.
+
+| | Cpu0 si, download | Cpu0 si, upload |
+|---|---|---|
+| iptables only | 94 to 100% | 90 to 94% |
+| Flowtable loaded | 92 to 99% | 24 to 37% |
+
+So the Pi was never short on total CPU. It was maxing out one core.
+
+On upload, the flowtable cut softirq load by roughly two thirds. On download,
+`si` barely moved, but that same saturated core was now pushing ~55 Mbps more
+traffic, so each packet got cheaper to handle.
+
+My hypothesis for the difference: on downloads, a large share of the remaining
+per-packet work happens outside netfilter, receiving on the built-in port and
+transmitting out over the USB adapter. The flowtable only removes the netfilter
+part. I haven't verified this, and `top` snapshots taken mid-test are rough,
+so I'm treating it as a lead rather than a conclusion.
+
+Follow-up idea: spread packet processing across cores with RPS (Receive Packet
+Steering) and see whether core 0 stops being the ceiling.
+
+### Decision
+
+Keeping the flowtable, but not persisting it yet. Current firewall rules live
+in iptables-persistent, and Debian's `nftables.service` config starts with
+`flush ruleset`, which could wipe the NAT rules depending on boot order. The
+clean path is to rewrite the whole firewall as one native nftables file with
+the flowtable inside it. That happens as part of the default-drop firewall
+step.
+
+Note for that step: once a flow is offloaded, its packets skip the FORWARD
+chain. Firewall counters will only show the first few packets of each
+connection. That is expected and does not mean rules are being bypassed.
+
 ## Next
 
 1. **nftables with flow offload**, measured against the current 822 Mbps figure.
@@ -757,9 +908,7 @@ The image stays off GitHub, both for size and because it contains a private key.
    since this is the one step that can lock me out with no software recovery.
 3. **TP-Link Archer AX55 in AP mode** on the LAN side once it arrives. AX3000
    Wi-Fi 6 with gigabit ports, DHCP disabled, connected to `eth1`.
-4. **Confirm who owns gateway `192.168.1.1`** and whether the fast jack is meant
-   to be mine. It does not respond on port 80 and uses OpenDNS, which looks like
-   managed property equipment rather than a leftover consumer router.
+
 
 Later ideas: Pi-hole for network-wide ad blocking, Tailscale for remote access
 (port forwarding is unavailable behind the building's NAT), `vnstat` for traffic
