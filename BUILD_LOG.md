@@ -743,7 +743,7 @@ The image stays off GitHub, both for size and because it contains a private key.
 | DHCP/DNS | dnsmasq on `eth1`, pool `.100`–`.200`, upstream 1.1.1.1 / 8.8.8.8 |
 | NAT | iptables MASQUERADE on `eth0`, persisted via `netfilter-persistent` |
 | SSH | key-only, passwords disabled, still listening on all interfaces |
-| Throughput | ~822 / 732 Mbps through the router vs ~879 / 736 at the wall |
+| Throughput |~889 / 729 Mbps with flowtable (not yet persistent), ~833 / 698 without|
 | Boot | ~4s to network-online |
 
 ---
