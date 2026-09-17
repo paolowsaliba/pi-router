@@ -899,17 +899,246 @@ Note for that step: once a flow is offloaded, its packets skip the FORWARD
 chain. Firewall counters will only show the first few packets of each
 connection. That is expected and does not mean rules are being bypassed.
 
+## 2026-09-16: Roadmap review
+
+Reviewed every resource in the project before picking the next steps:
+RaspAP docs, geerlingguy/pi-router (OpenWrt build), the pi-hole/pi-hole
+installer, and the pidiylab guide.
+
+- **RaspAP:** reference only. Its installer sets up its own dnsmasq and
+  hostapd configs, which would collide with my hand-built setup and with
+  Pi-hole. The AX55 covers WiFi anyway.
+- **OpenWrt:** saved for a v2 rebuild on the same Pi, with a performance
+  comparison against this build. My flowtable is essentially what OpenWrt's
+  software flow offloading toggle does, so the results carry over.
+- **Pi-hole:** still the ad blocker. Its v6 engine takes over DNS and DHCP
+  from dnsmasq, so it's a replacement, not an add-on.
+- **VPN:** eth0 has a private address (192.168.1.x), so I'm behind the
+  building's NAT. Plain WireGuard can't be reached from outside. Plan is a
+  Tailscale subnet router, which runs WireGuard underneath.
+- **vnstat:** worth adding. Tiny and almost no SD card writes.
+- **Grafana:** deferred until the SATA SSD goes in the Argon case. Steady
+  disk writes on an SD card aren't worth it yet.
+
+## 2026-09-16: Native nftables firewall
+
+### Why
+
+Until now, NAT lived in iptables-persistent and the flowtable experiment
+lived in a separate nftables table that vanished on reboot. Debian's
+`nftables.service` starts with `flush ruleset`, so the two could fight at
+boot. Rewrote everything as one file: `/etc/nftables.conf`.
+
+### Design
+
+- Default drop on INPUT and FORWARD
+- SSH, DNS, DHCP and ping accepted only from eth1 (LAN)
+- wlan0 (amenity WiFi) treated as a second untrusted WAN, with NAT so it
+  still works as backup internet
+- Flowtable built in, offloading only `ct state established` connections,
+  so a connection has already passed the rules before it gets the shortcut
+- Interface names written out directly, no variables
+
+### Gotcha: long heredoc paste over SSH
+
+My first attempt pasted the whole config as one `sudo tee <<'EOF'` block.
+The terminal dropped characters and jumbled lines together, and the `EOF`
+ended up inside the masquerade line. `tee` only writes the file, so nothing
+was applied. Fixed by deleting the file, opening it in nano, and pasting in
+three smaller chunks. I also split the longest icmpv6 line in two.
+
+Checked it came through clean before touching anything:
+
+```
+wc -l /etc/nftables.conf       # 63 lines
+tail -8 /etc/nftables.conf     # ends with masquerade + closing braces
+sudo nft -c -f /etc/nftables.conf   # no output = valid
+```
+
+### Applying it
+
+Took a rollback copy first (`iptables-save` to a file, copy of the original
+nftables.conf), then applied with `sudo nft -f /etc/nftables.conf`. The load
+is atomic, so there's never a moment with no firewall.
+
+Tests from Shrek, all passed:
+
+1. New SSH session to 192.168.50.1 connected
+2. Web pages loaded
+3. `ipconfig /release` + `/renew` got 192.168.50.165 back from dnsmasq
+4. Speed test hit 875 / 732 Mbps, with `OFFLOAD` counts of 52 to 64
+
+## 2026-09-16: eth1 hang under full load
+
+### What happened
+
+Ran a second speed test. Download reached about 900 Mbps, then partway
+through the upload everything stopped. SSH to 192.168.50.1 timed out. The
+HDMI console was already plugged in, so I diagnosed from there instead of
+rebooting (a reboot would have wiped the evidence).
+
+### Ruling things out
+
+| Check | Result | Meaning |
+|---|---|---|
+| `ip -br addr` | eth1 UP with 192.168.50.1 | Interface looked fine |
+| `vcgencmd get_throttled` | `0x0` | No undervoltage, power ruled out |
+| `ping -c 3 1.1.1.1` | Replies | Pi still had internet over eth0 |
+| `dmesg` | Nothing from the adapter | Driver hung without logging |
+
+So the Pi was healthy and the problem was between Shrek and the Pi.
+
+### Finding the actual failure
+
+With Shrek running `ping -t 192.168.50.1`, I checked eth1 repeatedly:
+
+- **RX packets frozen at 25268194** across every check
+- **RX errors climbing**, about 822k to 979k while stuck
+- **TX packets frozen** too
+- `ip neigh show dev eth1` showed Shrek as **FAILED**
+- The firewall's `input dropped` counter **stayed at 498**
+
+Shrek showed "Destination host unreachable" coming from its own address,
+which is Windows saying it can't resolve the Pi's MAC address.
+
+Frames were arriving at the adapter and getting rejected before reaching
+the system, and nothing was going out. The firewall never saw any of it.
+**Firewall ruled out. The USB adapter was hung while still reporting UP.**
+
+### The adapter
+
+```
+lsusb:       0b95:1790 ASIX Electronics Corp. AX88179 Gigabit Ethernet
+ethtool -i:  driver: cdc_ncm
+```
+
+I'd assumed a Realtek RTL8153. It's an ASIX AX88179 running on the generic
+CDC NCM driver. That matters for OpenWrt later, since it needs a different
+driver package than the Realtek one.
+
+### Recovery
+
+- `ip link set eth1 down` / `up` plus `nmcli con up lan`: **did not work.**
+  Counters stayed frozen.
+- Physical unplug and replug: **worked instantly.** The interface came back
+  as a new device (index 4 changed to 5, counters reset).
+- The flowtable had to be reloaded afterward, since it was attached to the
+  old eth1 that disappeared.
+
+A software replug does the same thing as pulling the cable:
+
+```
+echo 0 | sudo tee /sys/bus/usb/devices/2-2/authorized
+echo 1 | sudo tee /sys/bus/usb/devices/2-2/authorized
+sudo nft -f /etc/nftables.conf
+```
+
+### Trying to reproduce it
+
+Ran speed tests back to back under the same conditions, with `top` open in
+two sessions. Hit 903 / 724 Mbps. No hang. The problem is intermittent, so
+chasing it with speed tests could take days. Decided to build automatic
+recovery instead and let the logs show how often it happens.
+
+### Lesson on testing
+
+Shrek's WiFi was also connected to the amenity network, so Windows had two
+default gateways. Speeds proved the tests went through the Pi, but WiFi goes
+off during testing from now on so every result is clean.
+
+## 2026-09-16: Making the firewall permanent
+
+Retired the old iptables setup:
+
+```
+sudo systemctl disable netfilter-persistent
+sudo apt remove iptables-persistent netfilter-persistent
+```
+
+### Boot-order drop-in
+
+The flowtable needs eth0 and eth1 to exist when the file loads, and
+nftables starts very early in boot. If the USB adapter shows up late, the
+whole file fails, and the Pi boots with no firewall and no NAT. Added a
+drop-in so the service waits for both interfaces:
+
+`/etc/systemd/system/nftables.service.d/wait-for-nics.conf`
+
+```
+[Unit]
+Wants=sys-subsystem-net-devices-eth0.device sys-subsystem-net-devices-eth1.device
+After=sys-subsystem-net-devices-eth0.device sys-subsystem-net-devices-eth1.device
+```
+
+### Reboot test, passed
+
+- `systemctl status nftables`: active, drop-in listed, exit status 0
+- `nft list ruleset`: full ruleset with the flowtable on both ports
+- `systemd-analyze`: 21.5s total boot, so the wait costs nothing noticeable
+- `OFFLOAD` count climbed to 66 during a speed test after a cold boot
+
+Side note: `systemctl status` opens a pager and redraws on every window
+resize, which filled my terminal with repeats. `q` exits it, or use
+`--no-pager`.
+
+## 2026-09-16: eth1 watchdog
+
+### What it does
+
+`/usr/local/sbin/eth1-watchdog.sh`, run as `eth1-watchdog.service`.
+
+Every 20 seconds it reads eth1's counters from
+`/sys/class/net/eth1/statistics`. The hang signature is RX packets not
+moving while RX errors or drops keep climbing. Two strikes in a row (about
+40 seconds) triggers recovery:
+
+1. Find the adapter's USB address from the interface itself, so it still
+   works if the adapter moves ports
+2. Software replug through `authorized` 0 then 1
+3. Wait up to 30 seconds for eth1 to come back
+4. `nmcli con up lan`
+5. `nft -f /etc/nftables.conf` to reattach the flowtable
+6. Log both the detection and the recovery under the `eth1-watchdog` tag
+
+Requiring errors to climb, not just packets to stop, keeps it from firing
+when the LAN is simply idle.
+
+### Testing it
+
+Can't make the adapter hang on demand, so the script has a
+`--test-recover` flag that runs the recovery step by itself. With Shrek
+pinging the Pi, ran it from the console. Shrek dropped briefly and came
+back, both log lines showed in `journalctl -t eth1-watchdog`, and `OFFLOAD`
+was above zero on the next speed test, so the firewall reload worked.
+
+To see if it ever fires for real:
+
+```
+journalctl -t eth1-watchdog --no-pager
+```
+
+## Current state
+
+| Item | Status |
+|---|---|
+| WAN | eth0 on wall jack, private address behind building NAT |
+| LAN | eth1 (ASIX AX88179, cdc_ncm), 192.168.50.1/24 |
+| DHCP/DNS | dnsmasq |
+| Firewall | Native nftables, default drop, persistent, reboot tested |
+| Flowtable | Persistent, verified after cold boot |
+| Throughput | ~875 to 903 down / ~724 to 732 up with flowtable |
+| SSH | Key only, LAN only |
+| Adapter hang | Intermittent, auto-recovered by eth1-watchdog |
+| Console | HDMI + keyboard working |
+
 ## Next
 
-1. **nftables with flow offload**, measured against the current 822 Mbps figure.
-   Ceiling is about 57 Mbps, so this is optimization rather than rescue.
-2. **Default-drop INPUT and FORWARD policies**, plus restricting sshd to the LAN
-   interface. Waiting on console gear (standard HDMI cable and USB keyboard),
-   since this is the one step that can lock me out with no software recovery.
-3. **TP-Link Archer AX55 in AP mode** on the LAN side once it arrives. AX3000
-   Wi-Fi 6 with gigabit ports, DHCP disabled, connected to `eth1`.
-
-
-Later ideas: Pi-hole for network-wide ad blocking, Tailscale for remote access
-(port forwarding is unavailable behind the building's NAT), `vnstat` for traffic
-history, and migrating boot from SD to M.2 SATA once everything else is settled.
+1. New SD card image
+2. Pi-hole, replacing standalone dnsmasq, dashboard bound to 192.168.50.1
+3. nftables rule for the Pi-hole dashboard from eth1, then DNS redirect rule
+4. AX55 in access point mode, static 192.168.50.2, its DHCP off
+5. vnstat on eth0
+6. Tailscale subnet router for remote access
+7. Throughput recheck on the finished setup, optional RPS test
+8. Later: Grafana after the SATA SSD, OpenWrt v2 rebuild
+9. Anytime: ask the building who owns 192.168.1.1
