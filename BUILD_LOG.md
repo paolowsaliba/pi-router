@@ -1117,28 +1117,182 @@ To see if it ever fires for real:
 journalctl -t eth1-watchdog --no-pager
 ```
 
+## 2026-09-16: Pi-hole replaces dnsmasq
+
+### Why
+
+Pi-hole v6 runs its own DNS and DHCP engine (pihole-FTL, which has dnsmasq
+built in). Running both would fight over ports 53 and 67, so Pi-hole takes
+over both jobs and the standalone dnsmasq service is retired.
+
+### Before the switch
+
+Recorded what dnsmasq was doing so nothing got lost:
+
+```
+interface=eth1
+bind-dynamic
+dhcp-range=192.168.50.100,192.168.50.200,24h
+dhcp-option=3,192.168.50.1
+dhcp-option=6,192.168.50.1
+server=1.1.1.1
+server=8.8.8.8
+no-resolv
+cache-size=1000
+stop-dns-rebind
+rebind-localhost-ok
+```
+
+Backed it up to the repo as `dnsmasq.conf.pre-pihole`.
+
+Other checks before starting:
+
+- `/etc/resolv.conf` points at the building's DNS servers, not 127.0.0.1.
+  The Pi doesn't depend on its own DNS, so stopping dnsmasq couldn't break
+  the installer's downloads. Keeping it this way on purpose: if Pi-hole
+  breaks, the Pi can still reach the internet to fix itself.
+- Ports 80 and 443 were free for Pi-hole's built-in web server.
+- 24 GB free on the SD card.
+
+### Install
+
+1. Added a firewall rule so the dashboard is reachable from the LAN only:
+   ```
+   iifname "eth1" tcp dport { 80, 443 } accept
+   ```
+2. `sudo systemctl disable --now dnsmasq` to free port 53. Shrek's 24h
+   lease covered the short gap with no DHCP server.
+3. `curl -sSL https://install.pi-hole.net | bash`
+   - Interface: eth1
+   - Upstream: Cloudflare
+   - Blocklist: StevenBlack's Unified Hosts (80,170 domains)
+   - Web interface on, query logging on, privacy level 0
+
+Installed Pi-hole v6.4.3, web v6.6.
+
+**Installer quirk:** it printed 192.168.1.149 as the Pi-hole address even
+though I picked eth1. That's eth0's address. The installer guesses from the
+default route, which goes out eth0. It's only a display message, and every
+real setting points at 192.168.50.1.
+
+**Listening scope:** after install, pihole-FTL was answering on all
+interfaces. The firewall already blocked DNS on eth0 and wlan0, but I locked
+Pi-hole to eth1 as well so there are two layers.
+
+### Configuration
+
+Pi-hole v6 takes settings from the command line, so nothing was pasted
+into config files.
+
+```
+# DNS on eth1 only
+sudo pihole-FTL --config dns.interface eth1
+sudo pihole-FTL --config dns.listeningMode SINGLE
+
+# Upstream: Cloudflare + Quad9
+sudo pihole-FTL --config dns.upstreams '["1.1.1.1","1.0.0.1","9.9.9.9","149.112.112.112"]'
+
+# Local domain, rebind protection, shorter query history
+sudo pihole-FTL --config dns.domain.name home.arpa
+sudo pihole-FTL --config misc.dnsmasq_lines '["stop-dns-rebind","rebind-localhost-ok"]'
+sudo pihole-FTL --config database.maxDBdays 30
+
+# DHCP, same settings as the old dnsmasq
+sudo pihole-FTL --config dhcp.start 192.168.50.100
+sudo pihole-FTL --config dhcp.end 192.168.50.200
+sudo pihole-FTL --config dhcp.router 192.168.50.1
+sudo pihole-FTL --config dhcp.netmask 255.255.255.0
+sudo pihole-FTL --config dhcp.leaseTime 24h
+sudo pihole-FTL --config dhcp.ipv6 false
+sudo pihole-FTL --config dhcp.active true
+```
+
+Why these choices:
+
+- **Quad9** (9.9.9.9) replaced Google. It blocks known malware and phishing
+  domains before Pi-hole's lists even run.
+- **home.arpa** is the official standard name for home networks. DHCP
+  clients now get it as their DNS suffix.
+- **Rebind protection** carried over from dnsmasq. It stops a website from
+  tricking a browser into attacking devices on the LAN.
+- **30 days of query history** instead of 91 cuts down on SD card writes.
+- **SINGLE mode instead of BIND:** SINGLE still opens sockets on 0.0.0.0 but
+  only answers queries that arrive on eth1. BIND would lock the sockets to
+  eth1's address, which can break when the interface disappears and comes
+  back. The eth1 watchdog does exactly that when it replugs the adapter, so
+  SINGLE is the safer fit.
+
+Changed the admin password with `sudo pihole setpassword`, since the
+installer's random one was printed to the terminal.
+
+Side note: `pihole status` without sudo printed permission warnings about
+`/etc/pihole/pihole.toml`. Harmless. Use `sudo pihole status`.
+
+### DNS redirect for hardcoded DNS
+
+Some devices ignore DHCP and query 8.8.8.8 or similar directly, which
+would skip ad blocking. Added a prerouting chain to the nat table that
+sends any DNS query from the LAN to Pi-hole, whatever address it was aimed
+at:
+
+```
+chain prerouting {
+  type nat hook prerouting priority dstnat; policy accept;
+  iifname "eth1" ip daddr != 192.168.50.1 udp dport 53 redirect to :53
+  iifname "eth1" ip daddr != 192.168.50.1 tcp dport 53 redirect to :53
+}
+```
+
+My SSH session dropped right after reloading the firewall. This also
+happened on the very first nftables apply. Reconnecting works fine, so it's
+not a problem, but it's worth knowing that any `nft -f` reload (including
+the one the watchdog runs) will kick existing SSH sessions.
+
+### Verification
+
+Pi side:
+
+- `ss` shows pihole-FTL owning 53 (DNS) and 67 (DHCP), with 80 and 443 for
+  the dashboard
+- `pihole-FTL --config dhcp` matches the settings above
+
+From Shrek, with WiFi off:
+
+| Test | Result | Meaning |
+|---|---|---|
+| `ipconfig /renew` | 192.168.50.165, gateway and DNS 192.168.50.1 | Pi-hole DHCP works |
+| DHCP Server field | 192.168.50.1, suffix `home.arpa` | Lease came from Pi-hole |
+| `nslookup doubleclick.net` | `0.0.0.0` from pi.hole | Blocking works |
+| `nslookup doubleclick.net 8.8.8.8` | `0.0.0.0` | Redirect caught a query aimed at Google |
+| `nslookup google.com` | Real addresses | Normal lookups work |
+
+The second test is the fun one. Windows reports asking `dns.google`, but the
+Pi intercepted the query and Pi-hole answered with a block.
+
 ## Current state
 
 | Item | Status |
 |---|---|
 | WAN | eth0 on wall jack, private address behind building NAT |
 | LAN | eth1 (ASIX AX88179, cdc_ncm), 192.168.50.1/24 |
-| DHCP/DNS | dnsmasq |
+| DHCP | Pi-hole, .100 to .200, 24h leases |
+| DNS | Pi-hole on eth1, Cloudflare + Quad9 upstream, home.arpa |
+| Ad blocking | StevenBlack Unified Hosts, 80,170 domains |
+| DNS redirect | All LAN DNS forced through Pi-hole |
 | Firewall | Native nftables, default drop, persistent, reboot tested |
 | Flowtable | Persistent, verified after cold boot |
-| Throughput | ~875 to 903 down / ~724 to 732 up with flowtable |
-| SSH | Key only, LAN only |
 | Adapter hang | Intermittent, auto-recovered by eth1-watchdog |
-| Console | HDMI + keyboard working |
+| dnsmasq | Service disabled, config backed up |
 
 ## Next
 
-1. New SD card image
-2. Pi-hole, replacing standalone dnsmasq, dashboard bound to 192.168.50.1
-3. nftables rule for the Pi-hole dashboard from eth1, then DNS redirect rule
-4. AX55 in access point mode, static 192.168.50.2, its DHCP off
-5. vnstat on eth0
-6. Tailscale subnet router for remote access
-7. Throughput recheck on the finished setup, optional RPS test
-8. Later: Grafana after the SATA SSD, OpenWrt v2 rebuild
-9. Anytime: ask the building who owns 192.168.1.1
+1. Reboot test with Pi-hole: DHCP and blocking work after a cold boot
+2. Watchdog check with Pi-hole: `--test-recover`, then renew DHCP on Shrek
+3. Remove the old dnsmasq package once both pass
+4. New SD card image
+5. AX55 in access point mode, static 192.168.50.2, its DHCP off
+6. vnstat on eth0
+7. Tailscale subnet router for remote access
+8. Throughput recheck on the finished setup, optional RPS test
+9. Later: Grafana after the SATA SSD, OpenWrt v2 rebuild
+10. Anytime: ask the building who owns 192.168.1.1
