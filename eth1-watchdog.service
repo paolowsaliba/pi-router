@@ -1,0 +1,11 @@
+[Unit]
+Description=Recover eth1 USB adapter if it hangs
+After=nftables.service NetworkManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/eth1-watchdog.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
