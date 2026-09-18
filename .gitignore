@@ -5,3 +5,7 @@ system-connections/
 *.key
 id_*
 .env
+# Pi-hole config holds the dashboard password hash
+pihole.toml
+# SD card images are huge and contain private keys
+*.img
