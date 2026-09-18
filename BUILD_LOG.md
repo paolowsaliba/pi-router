@@ -1269,30 +1269,171 @@ From Shrek, with WiFi off:
 The second test is the fun one. Windows reports asking `dns.google`, but the
 Pi intercepted the query and Pi-hole answered with a block.
 
+## 2026-09-17: AX55 access point, WiFi is live
+
+### Why
+
+The Pi has one LAN port, so it could only serve one wired device. The
+TP-Link Archer AX55 fills two gaps at once: it's the WiFi radio and the
+switch. In access point mode its WAN port gets bridged with its four LAN
+ports, so everything behind it lands on 192.168.50.0/24 and gets addresses
+and DNS from Pi-hole.
+
+### Topology
+
+```
+wall jack -> [eth0] Pi [eth1] -> AX55 WAN port
+                                 AX55 LAN ports -> Shrek, future wired gear
+                                 AX55 WiFi      -> phone, laptops, TV
+```
+
+TP-Link's instructions for access point mode say to use the WAN port to
+connect to the existing network, which feels backwards but is correct.
+NAT, QoS, and parental controls turn off in this mode, which is the point:
+the Pi does all of that.
+
+### Setup order
+
+Configured the AX55 by itself first, with nothing in its WAN port, so two
+DHCP servers were never on the same wire.
+
+1. Firmware check, then admin password
+2. Advanced, then System, then Operation Mode, set to **Access Point**
+3. Wireless settings (see below)
+4. Network, then LAN, set to **Static IP**:
+   - IP 192.168.50.2, mask 255.255.255.0
+   - Gateway and Primary DNS both 192.168.50.1
+5. **DHCP Server: Off**
+6. Cabled Pi eth1 to the AX55 WAN port, moved Shrek to an AX55 LAN port
+
+Static IP matters here. On DHCP, the management page would move around and
+I'd have to hunt for it each time.
+
+### Gotcha: Auto DHCP didn't step aside
+
+The AX55's DHCP server was set to **Auto**, which is supposed to detect
+another DHCP server and disable itself. It didn't. Shrek was holding
+192.168.50.87 with a 2-hour lease, while Pi-hole hands out .100 to .200
+with 24-hour leases, so that address came from the AX55.
+
+With two DHCP servers on one network, devices get settings from whichever
+answers first, and anything served by the AX55 skips Pi-hole entirely.
+Setting DHCP to **Off** explicitly fixed it. After a release and renew,
+Shrek came back on 192.168.50.165 with DHCP server 192.168.50.1.
+
+Lesson: don't trust "Auto" to detect another DHCP server. Turn it off by
+hand and verify with `ipconfig /all` on a client.
+
+### Wireless settings and why
+
+| Setting | Value | Reason |
+|---|---|---|
+| Smart Connect | On | One network name, router picks the band per device |
+| Security | WPA3-Personal + WPA2-PSK | New devices get WPA3, old ones still connect |
+| Password | Long passphrase | WPA2 handshakes can be cracked offline, so length matters more than symbols |
+| 2.4 GHz width | 20 MHz | Apartment building. 40 MHz overlaps more neighbors and loses to interference |
+| 5 GHz width | 20/40/80 MHz | Plenty of room up there |
+| OFDMA | On | WiFi 6 feature, talks to several devices in one transmission |
+| WMM | On | Traffic prioritization, needed for full throughput |
+| AP Isolation | Off | Devices need to see each other for printing and casting |
+| TWT | Off | Battery saving for IoT, can add latency, nothing here benefits yet |
+| WPS | Off | Push-button pairing has known weaknesses |
+| Flow Control | Left at default | The router's own note warns it can cause drops |
+| Access Control | Off | MAC filtering is trivial to bypass and annoying to maintain |
+
+If a 2.4 GHz-only smart device ever refuses to pair, turn Smart Connect off
+during setup and back on after.
+
+## 2026-09-17: Two Pi-hole warnings cleared
+
+The Pi-hole diagnosis page had two messages. Both were harmless, and one
+was a security feature working as intended.
+
+### "interface eth1 does not currently exist"
+
+A startup race. pihole-FTL started before the USB adapter finished coming
+up. SINGLE listening mode recovers on its own once the interface appears,
+which is why DNS worked anyway. Fixed permanently with the same trick used
+for the firewall:
+
+`/etc/systemd/system/pihole-FTL.service.d/wait-for-eth1.conf`
+
+```
+[Unit]
+Wants=sys-subsystem-net-devices-eth1.device
+After=sys-subsystem-net-devices-eth1.device
+```
+
+### "possible DNS-rebind attack detected: dns.msftncsi.com"
+
+This was `stop-dns-rebind` doing its job. It rejects DNS answers that point
+at private addresses, since that's how a website can trick a browser into
+reaching devices inside the LAN. The domain involved is what Windows uses
+to check whether it has internet, and the timing matched Shrek reconnecting
+after the AP change.
+
+The only symptom is Windows sometimes showing "no internet" while
+everything works. Allowed those two Microsoft domains while keeping rebind
+protection everywhere else:
+
+```
+sudo pihole-FTL --config misc.dnsmasq_lines '["stop-dns-rebind","rebind-localhost-ok","rebind-domain-ok=/msftncsi.com/msftconnecttest.com/"]'
+sudo systemctl restart pihole-FTL
+```
+
+Both messages cleared and haven't come back.
+
+### Verification
+
+From Shrek, wired through the AX55:
+
+- 192.168.50.165, gateway and DNS 192.168.50.1, 24-hour lease, `home.arpa`
+  suffix
+- `nslookup doubleclick.net` returns `0.0.0.0`, so blocking works through
+  the AP
+
+Three speed tests back to back:
+
+| Run | Down | Up | Ping |
+|---|---|---|---|
+| 1 | 891.3 | 705.5 | 3 ms |
+| 2 | 882.2 | 725.6 | 3 ms |
+| 3 | 885.0 | 740.2 | 3 ms |
+
+No measurable loss from adding the AP to the path, and no adapter hang
+across all three.
+
+From the Pi-hole dashboard:
+
+- Shrek, the iPhone, and 192.168.50.2 (the AX55 itself) all appear as DNS
+  clients, so even the access point uses Pi-hole
+- The iPhone had 113 blocked queries within its first session on WiFi
+
 ## Current state
 
 | Item | Status |
 |---|---|
 | WAN | eth0 on wall jack, private address behind building NAT |
 | LAN | eth1 (ASIX AX88179, cdc_ncm), 192.168.50.1/24 |
+| Switch and WiFi | AX55 in access point mode, static 192.168.50.2, its DHCP off |
 | DHCP | Pi-hole, .100 to .200, 24h leases |
 | DNS | Pi-hole on eth1, Cloudflare + Quad9 upstream, home.arpa |
 | Ad blocking | StevenBlack Unified Hosts, 80,170 domains |
 | DNS redirect | All LAN DNS forced through Pi-hole |
 | Firewall | Native nftables, default drop, persistent, reboot tested |
 | Flowtable | Persistent, verified after cold boot |
+| Throughput | ~882 to 891 down / ~705 to 740 up through the AP |
 | Adapter hang | Intermittent, auto-recovered by eth1-watchdog |
-| dnsmasq | Service disabled, config backed up |
+| Clients | Shrek wired, iPhone on WiFi, both filtered |
+
+The apartment now runs entirely on this router. Wired and wireless clients
+both get addresses, DNS, and ad blocking from the Pi.
 
 ## Next
 
-1. Reboot test with Pi-hole: DHCP and blocking work after a cold boot
-2. Watchdog check with Pi-hole: `--test-recover`, then renew DHCP on Shrek
-3. Remove the old dnsmasq package once both pass
-4. New SD card image
-5. AX55 in access point mode, static 192.168.50.2, its DHCP off
-6. vnstat on eth0
-7. Tailscale subnet router for remote access
-8. Throughput recheck on the finished setup, optional RPS test
-9. Later: Grafana after the SATA SSD, OpenWrt v2 rebuild
-10. Anytime: ask the building who owns 192.168.1.1
+1. vnstat on eth0 for daily and monthly usage tracking
+2. Tailscale subnet router for remote access (eth0 is behind building NAT,
+   so plain WireGuard can't be reached from outside)
+3. New SD card image once both are in
+4. Optional: RPS test to spread packet handling across cores
+5. Later: Grafana after the SATA SSD, OpenWrt v2 rebuild and comparison
