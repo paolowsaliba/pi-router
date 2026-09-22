@@ -476,6 +476,9 @@ This closes the largest of the three security gaps. sshd still listens on all
 interfaces including the WAN, but a key is now the only way in. Restricting the
 listener to the LAN side comes with the default-drop INPUT rules.
 
+**Follow-up, 09-19:** this did not stick. See the sshd_config.d ordering entry
+below.
+
 ### Made firewall.sh idempotent
 
 The script used `-A` to append rules, so running it twice produced duplicates.
@@ -733,17 +736,17 @@ The image stays off GitHub, both for size and because it contains a private key.
 
 ---
 
-## Current state
+## Checkpoint: state as of 2026-09-13
 
 | | |
 |---|---|
 | WAN | `eth0`, DHCP from the fast wall jack, profile `wan` |
 | LAN | `eth1` (USB adapter), static `192.168.50.1`, profile `lan` |
 | Wifi | `wlan0` on the amenity network, MAC-registered, internet only |
-| DHCP/DNS | dnsmasq on `eth1`, pool `.100`–`.200`, upstream 1.1.1.1 / 8.8.8.8 |
+| DHCP/DNS | dnsmasq on `eth1`, pool `.100`-`.200`, upstream 1.1.1.1 / 8.8.8.8 |
 | NAT | iptables MASQUERADE on `eth0`, persisted via `netfilter-persistent` |
 | SSH | key-only, passwords disabled, still listening on all interfaces |
-| Throughput |~889 / 729 Mbps with flowtable (not yet persistent), ~833 / 698 without|
+| Throughput | ~822 / 732 Mbps through the Pi, ~879 / 736 at the wall |
 | Boot | ~4s to network-online |
 
 ---
@@ -1344,6 +1347,9 @@ hand and verify with `ipconfig /all` on a client.
 If a 2.4 GHz-only smart device ever refuses to pair, turn Smart Connect off
 during setup and back on after.
 
+**Follow-up, 09-19:** Smart Connect turned out to be the cause of a bad WiFi
+speed result. See the band split entry below.
+
 ## 2026-09-17: Two Pi-hole warnings cleared
 
 The Pi-hole diagnosis page had two messages. Both were harmless, and one
@@ -1409,31 +1415,427 @@ From the Pi-hole dashboard:
   clients, so even the access point uses Pi-hole
 - The iPhone had 113 blocked queries within its first session on WiFi
 
+## 2026-09-18: Security audit
+
+Went through the repo and the running system looking for anything exposed.
+
+- **Repo is clean.** `git ls-files` shows only config files, scripts, and
+  docs. No passwords, keys, or tokens in any file or in git history. My
+  offline cruise guide (which has a password in it) was never committed.
+- **`.gitignore` extended** with `pihole.toml` and `*.img`, so a Pi-hole
+  config or an SD image can't get committed by accident.
+- **avahi-daemon disabled** (service and socket). Nothing on the network
+  needs mDNS from the router.
+- **Pi-hole NTP (port 123) disabled.** It only helps if clients get DHCP
+  option 42, and most devices ignore that anyway.
+
+## 2026-09-19: SSH password login was back on
+
+### What I found
+
+`sudo sshd -T` showed `passwordauthentication yes`. I disabled password
+login back on 09-11, so something reverted it, most likely the Trixie
+upgrade. With a short console password, that meant anyone on the WiFi could
+try to brute-force SSH.
+
+### First fix didn't work
+
+Created `/etc/ssh/sshd_config.d/99-hardening.conf`:
+
+```
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+```
+
+After a restart, `PermitRootLogin` and `KbdInteractiveAuthentication` took
+effect, but `PasswordAuthentication` was still `yes`.
+
+### Why
+
+Files in `sshd_config.d/` load in alphabetical order, and **for sshd the
+first value it sees wins**. Raspberry Pi Imager's `50-cloud-init.conf` sets
+`PasswordAuthentication yes` and loads before anything named `99-`. So `99-`
+is the weakest position, not the strongest. This is the opposite of how
+`/etc/sysctl.d/` behaves, where I used a `99-` prefix on purpose so it would
+load last and win.
+
+Side note: `cat` on that file gave "Permission denied". SSH config files
+are root-only, so it needs `sudo cat`.
+
+### Fix
+
+```
+sudo mv /etc/ssh/sshd_config.d/99-hardening.conf /etc/ssh/sshd_config.d/00-hardening.conf
+sudo sshd -t
+sudo systemctl restart ssh
+sudo sshd -T | grep -E 'passwordauthentication|permitrootlogin|kbdinteractive'
+```
+
+```
+permitrootlogin no
+passwordauthentication no
+kbdinteractiveauthentication no
+```
+
+Kept the working session open and confirmed a brand new SSH session still
+got in with my key before closing it.
+
+Lesson worth keeping: an OS upgrade can quietly undo hardening. Re-running
+`sshd -T` after any major upgrade is now part of the routine.
+
+## 2026-09-19: Power outage recovery
+
+The power in my room went out overnight, so the Pi went through an
+unplanned hard shutdown and cold boot. Good accidental test. Checked
+everything came back:
+
+| Check | Result |
+|---|---|
+| `systemctl --failed` | 0 units |
+| `nft list ruleset` | Full ruleset loaded, flowtable on eth0 + eth1 |
+| pihole-FTL, eth1-watchdog | Both active |
+| `ip -br addr` | eth1 holding 192.168.50.1 |
+| `journalctl -b -p err` | Only harmless alsa/bluetooth/wpa noise |
+| DNS and ad blocking from Shrek | Working |
+
+`dmesg` showed `EXT4-fs (mmcblk0p2): orphan cleanup on readonly fs`. That's
+the filesystem journal replaying after the unclean shutdown. It means the
+recovery worked and nothing was lost. The kernel command line already has
+`fsck.repair=yes`, and I set `sudo touch /forcefsck` so the next reboot
+runs a full check.
+
+The Argon case jumper set to Always ON (09-13) did its job here. The Pi came
+back on its own with no button press.
+
+**Confusing timestamps:** `uptime` said about 3 hours, but systemd said the
+services started 9 hours ago. The Pi has no real-time clock. At boot it
+restores a saved time from fake-hwclock, services get stamped with that
+stale time, then NTP jumps the clock forward. `uptime` uses a monotonic
+counter, so it's the one to trust. Timestamps from the first seconds of a
+boot are unreliable.
+
+## 2026-09-19: vnstat
+
+Turned out vnstat was already installed and collecting since 7/25, so
+`sudo systemctl enable --now vnstat` just confirmed it. Already had about
+159 GiB of September traffic on eth0.
+
+```
+vnstat -i eth0
+```
+
+## 2026-09-19: Tailscale subnet router
+
+### Why Tailscale
+
+eth0 has a private address behind the building's NAT, so a plain WireGuard
+server can't be reached from outside. Tailscale runs WireGuard underneath
+and gets through NAT without port forwarding. As a subnet router, it lets
+me reach the whole 192.168.50.0/24 LAN from anywhere, not just the Pi.
+
+### Install
+
+```
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --advertise-routes=192.168.50.0/24 --accept-dns=false
+```
+
+Installed Tailscale 1.102.4 from the official Debian trixie repo.
+
+`--accept-dns=false` matters here. Without it Tailscale would rewrite
+`/etc/resolv.conf` to point at MagicDNS. The Pi should keep resolving
+through upstream servers, not through itself or Tailscale, for the same
+reason recorded during the Pi-hole install: if Pi-hole breaks, the Pi can
+still reach the internet to fix itself.
+
+In the Tailscale admin console:
+
+- Approved the 192.168.50.0/24 subnet route. Advertising and approving are
+  separate steps, and the route does nothing until it's approved.
+- Disabled key expiry on pirouter, so remote access doesn't silently die
+  in 180 days at the exact moment I can't walk over and fix it.
+
+Left subnet route SNAT at its default. LAN devices don't know the 100.x
+range exists, and SNAT makes remote traffic look like it comes from
+192.168.50.1 so replies find their way back.
+
+### Warnings from `tailscale up`
+
+- **IPv6 forwarding disabled:** ignored. The LAN is IPv4 only and Pi-hole's
+  DHCP has IPv6 off.
+- **UDP GRO forwarding suboptimal on eth0:** fixed, see below.
+
+### Firewall rules
+
+My forward chain is policy drop. When more than one base chain sits on the
+same hook, a packet has to survive all of them, so Tailscale's own accept
+rules aren't enough on their own. Without my rules, remote traffic dies
+quietly.
+
+Backed up first (`/etc/nftables.conf.pre-tailscale`), then added:
+
+Input chain:
+
+```
+iifname "tailscale0" tcp dport { 22, 80, 443 } accept
+iifname "tailscale0" udp dport 53 accept
+iifname "tailscale0" icmp type echo-request accept
+iifname "eth0" udp dport 41641 accept
+```
+
+Forward chain:
+
+```
+iifname "tailscale0" oifname "eth1" accept
+iifname "eth1" oifname "tailscale0" accept
+```
+
+UDP 41641 is Tailscale's direct connection port. Behind building NAT it
+may not help, but if it does, traffic goes direct instead of relaying
+through Tailscale's DERP servers.
+
+**Placement gotcha:** I inserted the lines with `sed '/hook forward/r ...'`,
+which put the forward rules right after the chain header, above
+`ct state invalid drop`. That meant Tailscale traffic skipped the invalid
+check. Moved them in nano to sit after the `ct state` lines, next to the
+LAN-to-internet rule. The same sed also left one line with the wrong
+indent, because my cleanup only matched lines starting with
+`iifname "tailscale0"`. `sed ... r` inserts after the *matched* line, not
+where the rule logically belongs.
+
+Always `sudo nft -c -f /etc/nftables.conf` before the real reload. The
+reload still kicks existing SSH sessions.
+
+### NetworkManager was managing tailscale0
+
+`nmcli connection show` listed `tailscale0`. tailscaled creates and owns
+that interface, sets its addresses and installs its routes, so having
+NetworkManager also manage it can cause fights on restart. Told NM to leave
+it alone:
+
+`/etc/NetworkManager/conf.d/99-tailscale.conf`
+
+```
+[keyfile]
+unmanaged-devices=interface-name:tailscale0
+```
+
+After `sudo systemctl reload NetworkManager`, tailscale0 dropped off the
+list. Same class of problem as `netplan-eth0` back on 09-13: two things
+managing one interface.
+
+### UDP GRO
+
+Without GRO forwarding, forwarded UDP through the tunnel gets handled one
+packet at a time instead of in batches, which costs real throughput on a
+Pi 4. The ethtool setting doesn't survive a reboot, so it runs as a oneshot
+unit before tailscaled:
+
+`/etc/systemd/system/tailscale-gro.service`
+
+```
+[Unit]
+Description=Set UDP GRO forwarding on eth0 for Tailscale
+After=network-online.target
+Wants=network-online.target
+Before=tailscaled.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -K eth0 rx-udp-gro-forwarding on rx-gro-list off
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Verified with `systemctl status tailscale-gro` (active, exited, status 0)
+and `ethtool -k eth0 | grep udp-gro-forwarding` (on).
+
+### Phone access
+
+Installed Tailscale and Termius on my iPhone. Since password login is off,
+generated an ED25519 key in Termius and added its public key to
+`~/.ssh/authorized_keys` on the Pi. Checked permissions: `.ssh` at 700,
+`authorized_keys` at 600, both owned by psaliba. Wrong modes make sshd
+ignore the file silently, which is the same failure shape as the empty
+`authorized_keys` from 09-11.
+
+`sudo ssh-keygen -lf ~/.ssh/authorized_keys` confirms every line is a real
+key without printing the keys themselves. A valid ed25519 public key has 68
+characters in its middle field, which is an easy way to spot a truncated
+paste.
+
+Accepted the host fingerprint on first connect after checking it against
+`ssh-keygen -lf /etc/ssh/ssh_host_ecdsa_key.pub` on the Pi.
+
+### Testing, WiFi off, phone on cellular
+
+| Test | Result | Proves |
+|---|---|---|
+| SSH to the Pi's tailnet address | Connected | Tunnel and key auth work |
+| Safari to 192.168.50.1/admin | Pi-hole loaded | Subnet route works |
+| Safari to 192.168.50.2 | AX55 loaded | Other LAN devices reachable |
+
+The last two are the real proof. Reaching a 192.168.50.x address from
+cellular means the subnet route is approved and the forward rules pass
+traffic. SSH to the 100.x address alone would only prove the tunnel.
+
+### iCloud Private Relay
+
+iOS warned that Private Relay doesn't work on my network. Expected. The
+DNS redirect intercepts port 53, and Private Relay is built to skip the
+local resolver. If Relay were on, the iPhone would bypass Pi-hole entirely
+for Safari and its DNS, so no ad blocking, no query log, no local
+`home.arpa` names. Decided to leave Private Relay off for this network.
+iOS only allows one VPN at a time anyway, so Tailscale and Relay can't both
+run.
+
+### Repo
+
+Committed and pushed:
+
+- `nftables.conf` (Tailscale rules)
+- `tailscale-gro.service`
+- `99-tailscale-nm.conf` (renamed from `99-tailscale.conf` so it's obvious
+  it's a NetworkManager file, not a systemd unit)
+- `00-hardening.conf` (sshd)
+
+Nothing from `/var/lib/tailscale/` goes in the repo. That's where the node
+key lives.
+
+## 2026-09-19 to 09-20: WiFi band split
+
+### The slow speed test
+
+Shrek on WiFi right next to the AX55 got 78.7 / 74.6 Mbps. Wired through
+the AP gets ~885. `netsh wlan show interfaces` explained it:
+
+```
+Band            : 2.4 GHz
+Channel         : 2
+Receive rate    : 286.8
+Rssi            : -15
+```
+
+Smart Connect had put Shrek on 2.4 GHz, which I limited to 20 MHz for
+apartment interference. 286.8 Mbps is the ceiling for 2x2 802.11ax at
+20 MHz, and 2.4 GHz usually delivers about a quarter of the link rate in
+real throughput, because the band is half duplex and shares airtime with
+every neighbor. Near-symmetric up and down was the other clue that the
+wireless link was the bottleneck rather than the ISP.
+
+Why it picked 2.4: Smart Connect steers, the client decides. At -15 dBm
+both bands look perfect to the adapter, so there's no signal-quality reason
+to prefer 5 GHz, and Windows keeps reaching for the BSSID it last used.
+
+### Fix: separate SSIDs
+
+Turned Smart Connect off and split into `5th Floor Wifi 2.4 GHz` and
+`5th Floor Wifi 5 GHz`. Checked the Qualcomm adapter's Advanced properties
+for a band preference setting first, but WiFiCx drivers expose far fewer
+properties than older ones. Splitting the SSIDs is the fix that always
+works, and it costs nothing but automatic band switching, which barely
+matters in one apartment.
+
+Keeping 2.4 GHz on. IoT devices, smart plugs and microcontrollers are often
+2.4-only, some refuse to pair if the phone is on 5 GHz at the time, and the
+lower frequency passes through walls better.
+
+### The 5 GHz network disappeared
+
+After the split, the 5 GHz SSID worked briefly, then stopped showing up at
+all, while the AX55 UI reported the radio online on channel 149 (Auto).
+Region was correctly set to United States.
+
+Two theories, both wrong:
+
+- **DFS:** 149 is not a DFS channel, so no radar avoidance involved.
+- **Adapter can't see the upper UNII-3 channels:** a full scan showed Shrek
+  seeing plenty of other networks on 149 through 161.
+
+Also learned that `netsh wlan show networks` returns stale or partial
+results while associated. The first scan showed exactly one network in an
+apartment building, which can't be right. Disconnecting and scanning again
+showed 31.
+
+Pinning the channel to 36 fixed it. Most likely the 5 GHz radio wasn't
+actually beaconing after the Smart Connect change, and setting the channel
+forced a radio restart. Left it pinned rather than Auto, so it can't drift
+back into whatever state that was.
+
+### Tuning
+
+- Channel width 20/40/80, so capable clients get 80 MHz and older ones fall
+  back
+- Airtime Fairness on, so one slow device can't drag the band down
+- OFDMA on, TWT off, unchanged
+
+Result on Shrek: 5 GHz, channel 36, 1201 Mbps link rate, 100% signal.
+
+```
+560.9 / 377.1 Mbps, 4 ms ping
+629.96 / 423.08 Mbps, 6 ms ping
+```
+
+About half the link rate, which is normal for real WiFi once overhead,
+retries and half-duplex airtime are accounted for. 1201 is the ceiling for
+the AX55's 2x2 radio at 80 MHz, so there isn't much left on the table.
+
+### Channel survey
+
+The full scan is a good snapshot of the RF environment here:
+
+- **36 to 48** (the block I'm in) is crowded. The building's own FastMesh
+  APs have radios on 36, 40, 44 and 48, plus several neighbors and an
+  xfinitywifi hotspot.
+- **149 to 161** is also busy, with the mesh, two T-Mobile gateways and
+  others.
+- **100 to 128** is nearly empty. The few APs there report 1% channel
+  utilization.
+
+2.4 GHz is on channel 9, which overlaps both 6 and 11 rather than sitting
+in one of the three non-overlapping slots. Moving it to 1, 6 or 11 is on
+the list, low priority since that band only carries IoT.
+
+## 2026-09-19: SD card image
+
+New image after Tailscale was verified: `pirouter-2026-09-19-tailscale.img`.
+
 ## Current state
 
 | Item | Status |
 |---|---|
 | WAN | eth0 on wall jack, private address behind building NAT |
 | LAN | eth1 (ASIX AX88179, cdc_ncm), 192.168.50.1/24 |
-| Switch and WiFi | AX55 in access point mode, static 192.168.50.2, its DHCP off |
+| Switch and WiFi | AX55 in AP mode, static 192.168.50.2, DHCP off, cloud management off |
+| WiFi bands | Split SSIDs: 2.4 GHz at 20 MHz, 5 GHz pinned to channel 36 at 20/40/80 |
 | DHCP | Pi-hole, .100 to .200, 24h leases |
 | DNS | Pi-hole on eth1, Cloudflare + Quad9 upstream, home.arpa |
 | Ad blocking | StevenBlack Unified Hosts, 80,170 domains |
 | DNS redirect | All LAN DNS forced through Pi-hole |
 | Firewall | Native nftables, default drop, persistent, reboot tested |
 | Flowtable | Persistent, verified after cold boot |
-| Throughput | ~882 to 891 down / ~705 to 740 up through the AP |
+| Remote access | Tailscale subnet router, route approved, key expiry off |
+| SSH | Key only, password and root login off via `00-hardening.conf` |
+| Traffic stats | vnstat on eth0 |
+| Throughput | ~885 / 740 wired through the AP, ~560 to 630 down on 5 GHz WiFi |
 | Adapter hang | Intermittent, auto-recovered by eth1-watchdog |
-| Clients | Shrek wired, iPhone on WiFi, both filtered |
+| Power loss | Survived one unplanned outage with no intervention |
+| Backup | `pirouter-2026-09-19-tailscale.img` |
 
-The apartment now runs entirely on this router. Wired and wireless clients
-both get addresses, DNS, and ad blocking from the Pi.
+The apartment runs entirely on this router. Wired and wireless clients get
+addresses, DNS and ad blocking from the Pi, and the whole LAN is reachable
+from outside over Tailscale.
 
 ## Next
-
-1. vnstat on eth0 for daily and monthly usage tracking
-2. Tailscale subnet router for remote access (eth0 is behind building NAT,
-   so plain WireGuard can't be reached from outside)
-3. New SD card image once both are in
+1. Move 2.4 GHz off channel 9 to 1, 6 or 11
+2. Try 5 GHz on a DFS channel (100 or 104) now that the radio is stable,
+   and watch for the AP vacating the channel on a radar detection
+3. M.2 SATA SSD ordered. Install it, move the root filesystem off the SD
+   card, then revisit Grafana
 4. Optional: RPS test to spread packet handling across cores
-5. Later: Grafana after the SATA SSD, OpenWrt v2 rebuild and comparison
+5. Later: OpenWrt v2 rebuild and comparison. OpenWrt has a Tailscale
+   package, so remote access carries over. The LAN adapter needs the
+   CDC NCM / AX88179 driver, not the Realtek one
