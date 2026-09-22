@@ -1,25 +1,28 @@
 # Raspberry Pi Router
 
 A working home router built from a Raspberry Pi 4 running Raspberry Pi OS Lite.
-It handles DHCP, DNS caching, NAT, and firewalling for an apartment network that
-sits behind a building-provided internet connection.
+It handles DHCP, DNS, ad blocking, NAT, firewalling, and remote access for an
+apartment network that sits behind a building-provided internet connection.
 
 The interesting part of this project is not that a Pi can route packets. It is
 the constraints: an apartment with two unrelated networks in the walls, a
 captive portal, a gigabit uplink that outruns the hardware doing the routing,
-and no console access for most of the build.
+no public IP to forward ports to, and no console access for most of the build.
 
-**Status:** LAN interface, DHCP, and DNS working and tested against real
-hardware. NAT, WAN cutover, and firewall in progress.
+**Status:** in daily use. Every device in the apartment, wired and wireless,
+gets its address, DNS, and ad filtering from this Pi, and the whole LAN is
+reachable from outside over Tailscale.
 
 ---
 
 ## Hardware
 
 - Raspberry Pi 4 Model B (4GB)
-- Built-in Gigabit Ethernet (`eth0`) — WAN
-- UGREEN USB 3.0 to Gigabit Ethernet adapter (`eth1`) — LAN
-- Built-in wifi (`wlan0`) — internet fallback only, see below
+- Built-in Gigabit Ethernet (`eth0`), WAN
+- UGREEN USB 3.0 to Gigabit Ethernet adapter (`eth1`), LAN
+  - ASIX AX88179 on the `cdc_ncm` driver, confirmed with `lsusb`
+- Built-in wifi (`wlan0`), backup internet path only
+- TP-Link Archer AX55 in access point mode, WiFi 6 radio and 4-port switch
 - Argon ONE M.2 case
 - Samsung Pro Endurance 32GB microSD
 
@@ -32,20 +35,40 @@ hardware. NAT, WAN cutover, and firewall in progress.
         |
   [ wall jack ]                        ~885 Mbps down / 735 up
         |
-   eth0 (WAN)
+   eth0 (WAN, 192.168.1.x from the building)
         |
   +-----------------------------+
   |  Raspberry Pi 4             |
-  |  NAT, DHCP, DNS, firewall   |     wlan0 --- amenity wifi
-  |  LAN gateway 192.168.50.1   |              (internet only,
-  +-----------------------------+               client isolated)
+  |  nftables firewall + NAT    |     wlan0 --- amenity wifi
+  |  Pi-hole: DHCP, DNS, ads    |              (internet only,
+  |  Tailscale subnet router    |               client isolated)
+  |  LAN gateway 192.168.50.1   |
+  +-----------------------------+
         |
    eth1 (LAN, USB adapter)
         |
-  [ access point ]  <- planned, Wi-Fi 6
+  [ Archer AX55 ]  192.168.50.2, access point mode, its DHCP off
+     |        |
+  LAN ports   WiFi (split 2.4 / 5 GHz SSIDs)
         |
     my devices                          192.168.50.100 - .200
 ```
+
+---
+
+## What it does
+
+| Function | How |
+|---|---|
+| Routing and NAT | nftables, single `/etc/nftables.conf`, default drop on INPUT and FORWARD |
+| Throughput | nftables flowtable (software flow offload) on eth0 and eth1 |
+| DHCP and DNS | Pi-hole v6 (pihole-FTL), pool .100 to .200, 24h leases, `home.arpa` |
+| Ad blocking | Pi-hole with StevenBlack Unified Hosts, plus a DNS redirect rule so hardcoded resolvers can't escape it |
+| Upstream DNS | Cloudflare and Quad9 |
+| WiFi and switching | Archer AX55 in AP mode on the LAN side |
+| Remote access | Tailscale subnet router advertising 192.168.50.0/24 |
+| Traffic history | vnstat on eth0 |
+| Reliability | systemd watchdog that recovers the USB LAN adapter when it hangs |
 
 ---
 
@@ -85,101 +108,120 @@ still in the way.
 
 ### Why the wifi is not a management path
 
-The amenity network runs client isolation. Two devices with addresses in the
-same `/16` cannot reach each other, only the internet. So `wlan0` gives the Pi a
-route out, but it cannot be used to SSH in when the wired side is down. Local
-console is the only real recovery path for the firewall step.
+The amenity network runs client isolation. Both the Pi and a laptop can sit on
+`10.254.0.0/16` and still not reach each other. It is an internet path for the
+Pi and nothing more, which is why an HDMI console and USB keyboard were bought
+before arming a default-drop firewall.
 
----
+### No public IP
 
-## Config files
-
-| File | What it does |
-|---|---|
-| `lan-setup.sh` | The `nmcli` command that gives `eth1` its static `192.168.50.1` |
-| `dnsmasq.conf` | DHCP server and caching DNS resolver for the LAN |
-| `firewall.sh` | NAT masquerade and iptables rules. Interface names are variables at the top |
-| `.gitignore` | Keeps NetworkManager profiles and keys out of the repo |
-
-### dnsmasq notes
-
-`interface=eth1` with `bind-interfaces` keeps DHCP on the LAN side only. Without
-it, dnsmasq would offer addresses on the WAN interface too, which would mean
-handing out leases on the building's network.
-
-`no-resolv` is there for a specific reason. Without it, dnsmasq reads
-`/etc/resolv.conf` on startup and picks up whatever DNS server `wlan0` got from
-the amenity network's DHCP, adding it as a third upstream. Some queries would
-then leave through the building's resolver. `no-resolv` restricts it to the
-servers named in the config.
-
-### firewall.sh notes
-
-Interface names are variables:
-
-```bash
-WAN_IF="eth0"
-LAN_IF="eth1"
-```
-
-This matters because the WAN has already moved once during this build, from a
-planned wifi uplink to a wired jack. Keeping the names in one place means
-switching uplinks is a one-line change instead of a rewrite.
-
----
-
-## Things worth knowing if you rebuild this
-
-**The `dhcpcd.conf` instructions in most Pi router tutorials are dead.** Current
-Raspberry Pi OS uses NetworkManager. Editing that file silently does nothing.
-Use `nmcli` instead.
-
-**Files in `/etc/netplan/` are not necessarily netplan config.** On this OS,
-NetworkManager exports a YAML alongside each connection it creates. They carry
-`renderer: NetworkManager` and the NM UUID. The real config lives in
-`/etc/NetworkManager/system-connections/`, and those files contain wifi PSKs in
-plain text, so keep them out of version control.
-
-**Do not trust interface names.** `ethtool -i <iface>` and its `bus-info` line
-is the ground truth. A platform address means built-in, a USB path means an
-adapter.
-
-**When you reconfigure the interface you are connected over, chain the
-commands.** `nmcli con add ... && nmcli con up lan` completes even after the
-session drops. Then bootstrap back in with a temporary static address on the
-client, since DHCP is not running yet.
-
-**Use the fixed address, not mDNS.** `pirouter.local` was unreliable throughout,
-especially once the Pi had two active networks.
+`eth0` gets a private address from the building, so there is nothing to forward
+a port to. That ruled out a plain WireGuard server and pointed at Tailscale,
+which runs WireGuard underneath and traverses the NAT without port forwarding.
 
 ---
 
 ## Performance
 
 The uplink outruns the router, which makes throughput a real part of this
-project rather than an afterthought.
+project rather than an afterthought. Every number below was measured against the
+same Speedtest server, in A-B-A order, so ISP variance would show up instead of
+being credited to the router.
 
-Baseline measured at the wall with no VPN, at peak hours: **885 Mbps down,
-735 up, 1ms ping.**
+| Setup | Download | Upload |
+|---|---|---|
+| At the wall, no router | ~879 | ~736 |
+| Through the Pi, iptables NAT | ~834 | ~711 |
+| Through the Pi, nftables flowtable | ~889 | ~729 |
+| Flowtable removed again | ~833 | ~698 |
 
-A Pi 4 doing NAT with standard iptables rules typically lands somewhere between
-600 and 800 Mbps, because every packet is evaluated against the full rule chain.
-The plan is to measure three ways and write down all three numbers: at the wall,
-through the Pi with iptables, and through the Pi with nftables flow offload,
-which lets the kernel shortcut established connections.
+**Routing through the Pi with plain iptables cost about 57 Mbps of download
+(6.5%). The flowtable recovered essentially all of it.** The removed-again runs
+matching the earlier iptables runs is what rules out the ISP simply being faster
+that afternoon.
+
+Verified that the shortcut was actually in use rather than inferring it from
+throughput:
+
+```
+sudo conntrack -L 2>/dev/null | grep -c OFFLOAD
+24    (flowtable loaded)
+0     (after removal)
+```
+
+**The bottleneck is one core, not the CPU.** Per-core `top` showed nearly all
+packet handling landing on core 0 as `ksoftirqd/0`, sitting at 94 to 100%
+softirq during downloads while cores 1 to 3 stayed idle. The flowtable cut
+upload softirq by about two thirds and let that same saturated core push ~55
+Mbps more on download.
+
+Adding the access point cost no measurable throughput: 882 to 891 down and 705
+to 740 up wired through it.
+
+---
+
+## Files
+
+| File | What it is |
+|---|---|
+| `nftables.conf` | The whole firewall: default drop, NAT, flowtable, DNS redirect |
+| `wait-for-nics.conf` | systemd drop-in so nftables waits for both NICs at boot |
+| `eth1-watchdog.sh` / `.service` | Detects and recovers the USB adapter hang |
+| `99-router.conf` | sysctl drop-in enabling IP forwarding |
+| `00-hardening.conf` | sshd: no passwords, no root login |
+| `tailscale-gro.service` | Enables UDP GRO forwarding on eth0 at boot |
+| `99-tailscale-nm.conf` | Tells NetworkManager not to manage `tailscale0` |
+| `lan-setup.sh` | The nmcli commands that create the LAN profile |
+| `dnsmasq.conf.pre-pihole` | The old dnsmasq config, kept for reference |
+| `firewall.sh` | The original iptables script, superseded by nftables |
+| `BUILD_LOG.md` | The full record: what broke, what I tried, what worked |
+
+---
+
+## Things worth knowing if you build one of these
+
+**Tutorials point at files this OS no longer uses.** Both `/etc/dhcpcd.conf`
+and `/etc/sysctl.conf` are gone on current Raspberry Pi OS, replaced by
+NetworkManager and `/etc/sysctl.d/`. Nano happily opens a blank buffer for a
+path that never existed, which makes a failed edit look like a successful one.
+
+**Do not trust interface names.** `ethtool -i <iface>` and its `bus-info` line
+are the ground truth. A platform address means built-in, a USB path means an
+adapter.
+
+**Drop-in load order is not the same everywhere.** In `/etc/sysctl.d/` a `99-`
+prefix wins because it loads last. In `/etc/ssh/sshd_config.d/` the *first*
+value wins, so a `99-` file loses to cloud-init's `50-` file. That silently
+undid my SSH hardening after an OS upgrade.
+
+**Two things managing one interface will bite you twice.** A leftover
+NetworkManager profile with `match: {}` added two minutes to every boot, and
+disabling it also killed the WAN, because it was quietly the only profile
+giving eth0 an address. Later, NetworkManager tried to manage `tailscale0`,
+which tailscaled owns. Same shape of problem.
+
+**"Auto" DHCP detection does not work.** The access point's DHCP server was set
+to Auto, which is supposed to stand down when it sees another DHCP server. It
+did not, and clients were getting leases from the wrong device. Turn it off by
+hand and verify from a client.
+
+**When you reconfigure the interface you are connected over, chain the
+commands.** `nmcli con add ... && nmcli con up lan` completes even after the
+session drops.
+
+**Read the logs instead of pattern-matching the symptom.** The two-minute boot
+delay got two confident wrong diagnoses before the NetworkManager journal named
+the cause on the first read.
 
 ---
 
 ## Remaining work
 
-- [ ] Enable IP forwarding and apply the NAT rule
-- [ ] Cut `eth0` over to the fast jack and verify a LAN client reaches the internet
-- [ ] Measure throughput through the router against the 885 baseline
-- [ ] Convert to nftables with flow offload and re-measure
-- [ ] Arm the default-drop firewall (requires console gear on hand)
-- [ ] Add a Wi-Fi 6 access point on the LAN side
-- [ ] Confirm who owns gateway `192.168.1.1` and whether that jack is mine
-
-Later ideas: Pi-hole for network-wide ad blocking, Tailscale for remote access
-(port forwarding is unavailable behind the building's NAT), and `vnstat` for
-traffic history.
+- [ ] Move 2.4 GHz off channel 9 onto 1, 6, or 11
+- [ ] Try 5 GHz on a DFS channel (100 or 104), where the band is nearly empty
+- [ ] Install the M.2 SATA SSD, move the root filesystem off the SD card
+- [ ] Grafana dashboards once the SSD is in and disk writes are cheap
+- [ ] RPS test, to see whether spreading packet handling across cores lifts the
+      core-0 ceiling
+- [ ] OpenWrt v2 rebuild on the same hardware, with a performance comparison
+- [ ] Confirm who owns gateway `192.168.1.1`
